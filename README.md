@@ -69,6 +69,10 @@ As configurações ficam em `%APPDATA%\apk-lab-relay` (Windows), `~/Library/Appl
 - Os `Set-Cookie` voltam no cabeçalho `x-apkweb-set-cookie`, como um array JSON.
 - Quando o destino não responde, o relay devolve 502 com `x-apkweb-relay-error-code` (`ENOTFOUND`, `ECONNREFUSED`, `ETIMEDOUT`, `CERT_...`). O lab transforma esse código na exceção que o Android lançaria.
 
+## Túnel TCP (gRPC, HTTP/2, outros protocolos)
+
+Desde a 0.2.0, o relay também abre conexões TCP para o lab. Quando um app fala algo que não é HTTP/1.1 num socket (o gRPC do Cloud Firestore usa HTTP/2; MQTT; protocolos de banco de dados), o lab manda essa conexão pelo relay: a página abre um WebSocket em `ws://127.0.0.1:8787/<token>/tcp?host=…&port=…` e o relay conecta ao destino a partir do seu computador e repassa os bytes nos dois sentidos. Valem as mesmas regras do resto: só as páginas permitidas, só com o token, e destinos na rede local só com `--allow-private` (por exemplo, para os emuladores do Firebase rodando no seu computador).
+
 ## Desenvolver
 
 Precisa de Node.js 22 ou mais recente.

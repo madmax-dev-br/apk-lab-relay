@@ -18,12 +18,14 @@ const https = require('node:https');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { randomBytes } = require('node:crypto');
-const { isIP } = require('node:net');
+const { randomBytes, createHash } = require('node:crypto');
+const net = require('node:net');
+const tls = require('node:tls');
+const { isIP } = net;
 const dns = require('node:dns/promises');
 const { spawn } = require('node:child_process');
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const DEFAULT_PORT = 8787;
 const DEFAULT_ORIGINS = ['https://madmax-dev-br.github.io', 'http://127.0.0.1:8765', 'http://localhost:8765'];
 const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'host', 'content-length', 'expect']);
@@ -178,8 +180,77 @@ function createRelay({ token, origins = DEFAULT_ORIGINS, allowPrivate = false, l
     response.on('error', () => res.destroy()).pipe(res);
   });
   server.recent = recent;
+  server.on('upgrade', (req, socket) => tunnel({ req, socket, token, allowed, allowPrivate, lookup, timeoutMs, note }));
   return server;
 }
+
+// ---- TCP tunnel (/<token>/tcp): a TCP stream for a socket of the lab whose conversation is not HTTP/1.1 (HTTP/2 with prior knowledge, as gRPC clients speak; MQTT; a database
+// protocol). The page opens a WebSocket here (ws://127.0.0.1:<port>/<token>/tcp?host=&port=&tls=0|1&alpn=), the relay connects to the target from this machine and copies the bytes
+// both ways. First message (text JSON): {"connected":true,"alpn":...} or {"error":{"code","message"}}; then binary messages are the TCP bytes. tls=1: the relay does the TLS (the lab
+// hands the app's plaintext, as its fetch path does) with the ALPN list asked for, and reports the protocol the server chose. Same origin, token and private-address rules as above.
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+function wsFrame(opcode, payload) {
+  const n = payload.length, head = n < 126 ? 2 : n < 65536 ? 4 : 10, out = Buffer.alloc(head + n);
+  out[0] = 0x80 | opcode; if (n < 126) out[1] = n; else if (n < 65536) { out[1] = 126; out.writeUInt16BE(n, 2); } else { out[1] = 127; out.writeUInt32BE(Math.floor(n / 0x100000000), 2); out.writeUInt32BE(n >>> 0, 6); }
+  payload.copy?.(out, head) ?? out.set(payload, head); return out;
+}
+/** The client frames (masked) of a WebSocket byte stream: push(chunk) -> [{ opcode, payload }] (fragments joined). */
+function wsDecoder() {
+  let buffer = Buffer.alloc(0), parts = null, partsOpcode = 0;
+  return chunk => {
+    buffer = Buffer.concat([buffer, chunk]); const out = [];
+    for (;;) {
+      if (buffer.length < 2) break;
+      const fin = (buffer[0] & 0x80) !== 0, opcode = buffer[0] & 0x0f, masked = (buffer[1] & 0x80) !== 0; let length = buffer[1] & 0x7f, at = 2;
+      if (length === 126) { if (buffer.length < 4) break; length = buffer.readUInt16BE(2); at = 4; } else if (length === 127) { if (buffer.length < 10) break; length = buffer.readUInt32BE(2) * 0x100000000 + buffer.readUInt32BE(6); at = 10; }
+      const mask = at; if (masked) at += 4; if (buffer.length < at + length) break;
+      const payload = Buffer.from(buffer.subarray(at, at + length)); if (masked) for (let i = 0; i < length; i++) payload[i] ^= buffer[mask + (i & 3)];
+      buffer = buffer.subarray(at + length);
+      if (opcode >= 0x8) { out.push({ opcode, payload }); continue; }
+      if (opcode === 0) parts?.push(payload); else { parts = [payload]; partsOpcode = opcode; }
+      if (fin && parts) { out.push({ opcode: partsOpcode, payload: Buffer.concat(parts) }); parts = null; }
+    }
+    return out;
+  };
+}
+async function tunnel({ req, socket, token, allowed, allowPrivate, lookup, timeoutMs, note = () => {} }) {
+  const url = new URL(req.url, 'http://relay.invalid'), origin = req.headers.origin ?? '';
+  const refuse = (status, text, message) => { socket.end(`HTTP/1.1 ${status} ${text}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n${message}`); };
+  if (url.pathname !== `/${token}/tcp`) return refuse(404, 'Not Found', 'unknown path');
+  if (!allowed.has(origin)) return refuse(403, 'Forbidden', `origin not allowed: ${origin || '(none)'}`);
+  const key = req.headers['sec-websocket-key']; if (!key || String(req.headers.upgrade ?? '').toLowerCase() !== 'websocket') return refuse(400, 'Bad Request', 'a WebSocket upgrade is expected');
+  const host = url.searchParams.get('host') ?? '', port = Number(url.searchParams.get('port')), secure = url.searchParams.get('tls') === '1', alpn = (url.searchParams.get('alpn') ?? '').split(',').map(p => p.trim()).filter(Boolean);
+  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return refuse(400, 'Bad Request', 'host and port are required');
+  socket.write(['HTTP/1.1 101 Switching Protocols', 'Upgrade: websocket', 'Connection: Upgrade', `Sec-WebSocket-Accept: ${createHash('sha1').update(key + WS_GUID).digest('base64')}`, '', ''].join('\r\n'));
+  socket.setNoDelay?.(true);
+  const say = value => { if (!socket.destroyed) socket.write(wsFrame(0x1, Buffer.from(JSON.stringify(value)))); };
+  const closeFrame = code => wsFrame(0x8, Buffer.from([code >> 8, code & 255]));
+  const fail = (code, message) => { say({ error: { code, message: String(message).replace(/[\r\n]+/g, ' ').slice(0, 300) } }); socket.end(closeFrame(1011)); };
+  socket.on('error', () => {});
+  if (!allowPrivate) {
+    const name = host.replace(/^\[|\]$/g, '');
+    let addresses; try { addresses = isIP(name) ? [{ address: name }] : await lookup(name, { all: true }); } catch (error) { return fail(error.code ?? 'ENOTFOUND', error.message ?? String(error)); }
+    if (addresses.some(entry => privateAddress(entry.address))) return fail('APKWEB_RELAY_PRIVATE', `${name} is on this machine or the local network; start the relay with --allow-private to reach it`);
+  }
+  let connected = false; const started = Date.now();
+  const upstream = secure ? tls.connect({ host, port, servername: isIP(host) ? undefined : host, ALPNProtocols: alpn.length ? alpn : undefined }) : net.connect({ host, port });
+  const timer = setTimeout(() => { if (!connected) { upstream.destroy(); fail('ETIMEDOUT', `connect to ${host}:${port} timed out after ${timeoutMs} ms`); } }, timeoutMs);
+  upstream.once(secure ? 'secureConnect' : 'connect', () => { connected = true; clearTimeout(timer); upstream.setNoDelay?.(true); say({ connected: true, alpn: secure ? upstream.alpnProtocol || null : null }); note({ method: 'TCP', url: `${secure ? 'tls' : 'tcp'}://${host}:${port}`, status: 101, ms: Date.now() - started }); });
+  upstream.on('data', chunk => { if (!socket.destroyed) socket.write(wsFrame(0x2, chunk)); });
+  upstream.on('error', error => { clearTimeout(timer); if (!connected) { note({ method: 'TCP', url: `tcp://${host}:${port}`, status: 502, error: error.code ?? 'ECONNREFUSED', ms: Date.now() - started }); } if (!connected) fail(error.code ?? 'ECONNREFUSED', error.message); else socket.destroy(); });
+  upstream.on('close', () => { clearTimeout(timer); if (connected && !socket.destroyed) socket.end(closeFrame(1000)); });
+  const decode = wsDecoder();
+  socket.on('data', chunk => {
+    for (const { opcode, payload } of decode(chunk)) {
+      if (opcode === 0x2 || opcode === 0x1) { if (!upstream.destroyed) upstream.write(payload); }
+      else if (opcode === 0x9) socket.write(wsFrame(0xA, payload));
+      else if (opcode === 0x8) { upstream.end(); if (!socket.destroyed) socket.end(closeFrame(1000)); }
+    }
+  });
+  socket.on('close', () => { clearTimeout(timer); upstream.destroy(); });
+}
+
+
 
 // ---- the desktop app: settings kept between runs, the command line, the browser opened on the status page ----------------------------------------------------------------
 function configDir(env = process.env, platform = process.platform, home = os.homedir()) {

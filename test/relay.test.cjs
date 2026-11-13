@@ -115,3 +115,27 @@ test('settings: the command line over the saved ones, a token kept between runs,
   assert.equal(configDir({}, 'darwin', '/Users/a'), path.join('/Users/a', 'Library', 'Application Support', 'apk-lab-relay'));
   assert.equal(configDir({ XDG_CONFIG_HOME: '/x' }, 'linux', '/home/a'), path.join('/x', 'apk-lab-relay'));
 });
+
+test('the TCP tunnel: a WebSocket on /<token>/tcp connects to the target and copies bytes both ways; private targets, closed ports and other pages are refused', async () => {
+  const net = require('node:net');
+  const target = net.createServer(socket => socket.on('data', chunk => socket.write(Buffer.concat([Buffer.from('<'), chunk, Buffer.from('>')]))));
+  const targetPort = await listen(target);
+  const open = (port, query, origin = ORIGIN) => {
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/${TOKEN}/tcp?${query}`, { headers: { origin } }), messages = []; socket.binaryType = 'arraybuffer';
+    socket.onmessage = event => messages.push(typeof event.data === 'string' ? JSON.parse(event.data) : Buffer.from(event.data).toString());
+    const until = async (check, what) => { for (let i = 0; i < 300; i++) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 10)); } assert.fail(`${what}: ${JSON.stringify(messages)}`); };
+    return { socket, messages, until };
+  };
+  const { port, server } = await relay({ allowPrivate: true });
+  const live = open(port, `host=127.0.0.1&port=${targetPort}&tls=0`);
+  await live.until(() => live.messages.length, 'connected'); assert.deepEqual(live.messages[0], { connected: true, alpn: null });
+  live.socket.send(new TextEncoder().encode('PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'));
+  await live.until(() => live.messages.length > 1, 'the echo'); assert.equal(live.messages.slice(1).join(''), '<PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n>');
+  assert.equal(server.recent.at(-1).method, 'TCP', 'the status page lists the tunnel');
+  live.socket.close();
+  const strict = await relay(), refused = open(strict.port, `host=127.0.0.1&port=${targetPort}`);
+  await refused.until(() => refused.messages.length, 'refused'); assert.equal(refused.messages[0].error.code, 'APKWEB_RELAY_PRIVATE');
+  const stranger = new WebSocket(`ws://127.0.0.1:${port}/${TOKEN}/tcp?host=127.0.0.1&port=${targetPort}`, { headers: { origin: 'https://evil.example' } });
+  assert.equal(await new Promise(resolve => { stranger.onopen = () => resolve('open'); stranger.onerror = () => resolve('refused'); }), 'refused');
+  refused.socket.close(); target.close(); for (const s of [server, strict.server]) s.closeAllConnections?.();
+});
