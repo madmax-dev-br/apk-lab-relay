@@ -35,7 +35,7 @@ jobs:
         run: node scripts/build-sea.mjs --target ${{ matrix.target }}
       - name: Smoke test the executable
         run: node scripts/smoke.mjs
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: apk-lab-relay-${{ matrix.target }}
           path: release/*
