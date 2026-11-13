@@ -7,7 +7,7 @@
   "bin": { "apk-lab-relay": "src/relay.cjs" },
   "scripts": {
     "start": "node src/relay.cjs",
-    "test": "node --test test/",
+    "test": "node --test \"test/**/*.test.cjs\"",
     "build": "node scripts/build-sea.mjs",
     "smoke": "node scripts/smoke.mjs"
   },
