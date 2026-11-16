@@ -1,14 +1,14 @@
 # APK Lab Relay
 
-Um programa pequeno para Windows, Linux e macOS que deixa o [APK Browser Lab](https://madmax-dev-br.github.io/apk-browser-lab-site/) acessar qualquer servidor sem erro de CORS.
+A small program for Windows, Linux and macOS that lets the [APK Browser Lab](https://madmax-dev-br.github.io/apk-browser-lab-site/) reach any server without CORS errors.
 
-O navegador bloqueia as respostas de servidores que não autorizam a página do lab, e os servidores que um app Android real usa não autorizam. Com o relay aberto, o lab envia as requisições do app para este programa. Ele as repete a partir do seu computador, do jeito que o aparelho enviaria, e devolve a resposta ao lab.
+The browser blocks responses from servers that do not authorize the lab's page, and the servers a real Android app talks to do not. With the relay open, the lab sends the app's requests to this program. It repeats them from your computer, the way the device would send them, and hands the response back to the lab.
 
-## Baixar
+## Download
 
-Os executáveis estão em [Releases](../../releases/latest):
+The executables are in [Releases](../../releases/latest):
 
-| Sistema | Arquivo |
+| System | File |
 | --- | --- |
 | Windows (x64) | `apk-lab-relay-windows-x64.exe` |
 | macOS (Apple Silicon) | `apk-lab-relay-macos-arm64.tar.gz` |
@@ -16,80 +16,81 @@ Os executáveis estão em [Releases](../../releases/latest):
 | Linux (x64) | `apk-lab-relay-linux-x64.tar.gz` |
 | Linux (ARM64) | `apk-lab-relay-linux-arm64.tar.gz` |
 
-`SHA256SUMS.txt` traz o hash de cada arquivo.
+`SHA256SUMS.txt` has the hash of each file.
 
-## Usar
+## Use
 
-1. Abra o programa. No Windows, dê dois cliques no `.exe`. No macOS e no Linux, extraia o `.tar.gz` e rode `./apk-lab-relay`.
-2. Ele abre uma página de status no navegador (`http://127.0.0.1:8787/`) com o endereço do proxy. Copie o endereço.
-3. No lab, vá em **Controles › Dispositivo › Proxy** e cole o endereço.
-4. Deixe o programa aberto enquanto usa o lab. Fechar a janela (ou Ctrl+C) encerra.
+1. Open the program. On Windows, double-click the `.exe`. On macOS and Linux, extract the `.tar.gz` and run `./apk-lab-relay`.
+2. It opens a status page in the browser (`http://127.0.0.1:8787/`) with the proxy address. Copy the address.
+3. In the lab, go to **Controls › Device › Proxy** and paste the address.
+4. Keep the program open while you use the lab. Closing the window (or Ctrl+C) stops it.
 
-O endereço tem um token aleatório. Ele fica salvo, então nas próximas vezes o endereço é o mesmo e você não precisa colar de novo.
+The address has a random token. It is saved, so the address stays the same next time and you do not have to paste it again.
 
-### Avisos do sistema na primeira vez
+### System warnings the first time
 
-Os executáveis não são assinados.
+The executables are not signed.
 
-- **Windows:** o SmartScreen pode avisar "O Windows protegeu o computador". Clique em **Mais informações › Executar assim mesmo**.
-- **macOS:** se o sistema recusar abrir, rode `xattr -d com.apple.quarantine ./apk-lab-relay` na pasta extraída, ou abra pelo Finder com clique direito › **Abrir**.
+- **Windows:** SmartScreen may warn that Windows protected your PC. Click **More info › Run anyway**.
+- **macOS:** if the system refuses to open it, run `xattr -d com.apple.quarantine ./apk-lab-relay` in the extracted folder, or open it from Finder with right click › **Open**.
 
-## Opções
+## Options
 
 ```
-apk-lab-relay [opções]
-  --port <n>           porta em 127.0.0.1 (padrão 8787; fica salva)
-  --origin <url>       página que pode usar o relay (repita para várias; fica salva)
-  --allow-private      permite destinos neste computador e na rede local (fica salvo; --no-allow-private desliga)
-  --token <texto>      usa este token no endereço (fica salvo)
-  --new-token          gera um token novo (o endereço do Proxy muda)
-  --no-open            não abre o navegador na página de status
+apk-lab-relay [options]
+  --port <n>           port on 127.0.0.1 (default 8787; saved)
+  --origin <url>       a page that may use the relay (repeat for several; saved)
+  --token <text>       use this token in the address (saved)
+  --new-token          make a new token (the Proxy address changes)
+  --no-open            do not open the status page in the browser
   --version, --help
 ```
 
-Por padrão, podem usar o relay o lab publicado (`https://madmax-dev-br.github.io`) e uma cópia local (`http://127.0.0.1:8765`, `http://localhost:8765`). Para usar o relay com o lab servido em outro endereço, passe `--origin http://localhost:5173`.
+By default the published lab (`https://madmax-dev-br.github.io`) and a local copy (`http://127.0.0.1:8765`, `http://localhost:8765`) may use the relay. To use it with the lab served from another address, pass `--origin http://localhost:5173`.
 
-As configurações ficam em `%APPDATA%\apk-lab-relay` (Windows), `~/Library/Application Support/apk-lab-relay` (macOS) ou `~/.config/apk-lab-relay` (Linux).
+The relay reaches any destination: the internet, this computer and the local network. There is no option for that. `--allow-private`, from older versions, is still accepted and does nothing.
 
-## Segurança
+Settings live in `%APPDATA%\apk-lab-relay` (Windows), `~/Library/Application Support/apk-lab-relay` (macOS) or `~/.config/apk-lab-relay` (Linux).
 
-- O relay escuta só em `127.0.0.1`: outro computador da rede não alcança.
-- Cada requisição precisa trazer o token no caminho e vir de uma das páginas permitidas, então outro site aberto no mesmo navegador não consegue usar o relay.
-- Destinos neste computador ou na rede local (loopback, 10.x, 192.168.x, ...) são recusados, a não ser com `--allow-private`.
-- A página de status responde só a `127.0.0.1` e `localhost`, o que protege contra *DNS rebinding*.
-- Nada é guardado além das configurações. Requisições e respostas passam e são esquecidas, e o histórico da página de status (as últimas 50, sem query string) fica só na memória.
+## Security
 
-## Como funciona
+- The relay listens only on `127.0.0.1`: another computer on the network cannot reach it.
+- Every request must carry the token in its path and come from one of the allowed pages, so another site open in the same browser cannot use the relay.
+- Destinations are not restricted: whatever the lab asks for, the relay fetches from your computer, including servers on this computer and on your local network.
+- The status page answers only to `127.0.0.1` and `localhost`, which protects against *DNS rebinding*.
+- Nothing is stored besides the settings. Requests and responses pass through and are forgotten, and the status page's history (the last 50, without query strings) lives only in memory.
 
-É o mesmo protocolo do `cors-relay.mjs` do lab:
+## How it works
 
-- O destino vai no parâmetro `url`.
-- Os cabeçalhos que o navegador não deixa enviar (Cookie, User-Agent, Origin, Referer...) chegam como `x-apkweb-<nome>` e saem com o nome original.
-- Os redirecionamentos são seguidos aqui. Credenciais não seguem para outro host.
-- Os `Set-Cookie` voltam no cabeçalho `x-apkweb-set-cookie`, como um array JSON.
-- Quando o destino não responde, o relay devolve 502 com `x-apkweb-relay-error-code` (`ENOTFOUND`, `ECONNREFUSED`, `ETIMEDOUT`, `CERT_...`). O lab transforma esse código na exceção que o Android lançaria.
+It is the same protocol as the lab's `cors-relay.mjs`:
 
-## Túnel TCP (gRPC, HTTP/2, outros protocolos)
+- The destination goes in the `url` parameter.
+- Headers the browser will not send (Cookie, User-Agent, Origin, Referer...) arrive as `x-apkweb-<name>` and leave under their original name.
+- Redirects are followed here. Credentials do not follow to another host.
+- `Set-Cookie` headers come back in the `x-apkweb-set-cookie` header, as a JSON array.
+- When the destination does not answer, the relay returns 502 with `x-apkweb-relay-error-code` (`ENOTFOUND`, `ECONNREFUSED`, `ETIMEDOUT`, `CERT_...`). The lab turns that code into the exception Android would throw.
 
-Desde a 0.2.0, o relay também abre conexões TCP para o lab. Quando um app fala algo que não é HTTP/1.1 num socket (o gRPC do Cloud Firestore usa HTTP/2; MQTT; protocolos de banco de dados), o lab manda essa conexão pelo relay: a página abre um WebSocket em `ws://127.0.0.1:8787/<token>/tcp?host=…&port=…` e o relay conecta ao destino a partir do seu computador e repassa os bytes nos dois sentidos. Valem as mesmas regras do resto: só as páginas permitidas, só com o token, e destinos na rede local só com `--allow-private` (por exemplo, para os emuladores do Firebase rodando no seu computador).
+## TCP tunnel (gRPC, HTTP/2, other protocols)
 
-## Desenvolver
+Since 0.2.0 the relay also opens TCP connections for the lab. When an app speaks something other than HTTP/1.1 on a socket (Cloud Firestore's gRPC uses HTTP/2; MQTT; database protocols), the lab sends that connection through the relay: the page opens a WebSocket at `ws://127.0.0.1:8787/<token>/tcp?host=…&port=…`, and the relay connects to the destination from your computer and passes the bytes both ways. The same rules apply as for the rest: only the allowed pages, only with the token. Any destination is reachable, including emulators running on your computer (for example the Firebase emulators).
 
-Precisa de Node.js 22 ou mais recente.
+## Develop
+
+Needs Node.js 22 or newer.
 
 ```bash
 npm ci
 npm test
-npm start          # roda o relay direto do código
-npm run build      # gera o executável deste sistema em release/ (Node oficial, com suporte a single executable)
-npm run smoke      # testa o executável gerado
+npm start          # runs the relay straight from the source
+npm run build      # builds this system's executable into release/ (official Node, with single executable support)
+npm run smoke      # tests the built executable
 ```
 
-## Publicar uma versão
+## Publish a version
 
-O CI (`.github/workflows/build.yml`) roda os testes e gera os executáveis dos cinco sistemas a cada push. Para publicar uma versão:
+CI (`.github/workflows/build.yml`) runs the tests and builds the executables for the five systems on every push. To publish a version:
 
-1. Mude a versão em `package.json` e `VERSION` em `src/relay.cjs`.
-2. Faça o commit e crie a tag: `git tag v0.2.0 && git push origin main v0.2.0`.
+1. Change the version in `package.json` and `VERSION` in `src/relay.cjs`.
+2. Commit and create the tag: `git tag v0.2.0 && git push origin main v0.2.0`.
 
-O CI cria a release com os executáveis e os checksums.
+CI creates the release with the executables and the checksums.

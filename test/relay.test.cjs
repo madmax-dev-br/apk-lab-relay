@@ -1,6 +1,6 @@
 'use strict';
 // The relay against the contract the lab expects (the same as the lab's scripts/cors-relay.mjs), with the browser's side played by fetch. Every server here is local: an upstream on
-// 127.0.0.1 (reached with allowPrivate, as only the tests need) and the relay itself; no request leaves this computer.
+// 127.0.0.1 and the relay itself; no request leaves this computer.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
@@ -8,7 +8,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { gzipSync, gunzipSync } = require('node:zlib');
-const { createRelay, privateAddress, parseArguments, resolveSettings, configDir, loadSettings, saveSettings, DEFAULT_ORIGINS } = require('../src/relay.cjs');
+const { createRelay, parseArguments, resolveSettings, configDir, loadSettings, saveSettings, DEFAULT_ORIGINS } = require('../src/relay.cjs');
 
 const ORIGIN = 'https://lab.example.test', TOKEN = 'test-token-123';
 const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -33,7 +33,7 @@ test.before(async () => { upstreamPort = await listen(upstream); });
 test.after(() => { upstream.close(); for (const server of relays) server.close(); });
 
 test("a GET goes out with the app's own Cookie and User-Agent (x-apkweb-*) and none of the page's; both Set-Cookie values come back; CORS for the page only", async () => {
-  const { base } = await relay({ allowPrivate: true });
+  const { base } = await relay();
   const response = await via(base, target('/hello?x=1'), { headers: { 'x-apkweb-user-agent': 'Dalvik/2.1.0 (Linux; U; Android 13)', 'x-apkweb-cookie': 'a=1', 'X-App': 'yes', 'sec-fetch-mode': 'cors' } });
   assert.equal(response.status, 200);
   const seen = await response.json();
@@ -45,7 +45,7 @@ test("a GET goes out with the app's own Cookie and User-Agent (x-apkweb-*) and n
 });
 
 test('a POST body passes through; redirects are followed (303 turns into GET) and credentials do not follow to another host', async () => {
-  const { base } = await relay({ allowPrivate: true });
+  const { base } = await relay();
   const posted = await (await via(base, target('/echo'), { method: 'POST', body: '{"a":1}', headers: { 'content-type': 'application/json' } })).json();
   assert.deepEqual([posted.method, posted.body, posted.headers['content-type']], ['POST', '{"a":1}', 'application/json']);
   assert.equal((await (await via(base, target('/redirect'))).json()).url, '/final');
@@ -55,60 +55,48 @@ test('a POST body passes through; redirects are followed (303 turns into GET) an
 });
 
 test('a compressed body is passed as the server sent it, with its Content-Encoding', async () => {
-  const { port } = await relay({ allowPrivate: true });
+  const { port } = await relay();
   const raw = await new Promise((resolve, reject) => http.get({ host: '127.0.0.1', port, path: `/${TOKEN}/?url=${encodeURIComponent(target('/gzip'))}`, headers: { origin: ORIGIN } }, res => { const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => resolve({ headers: res.headers, body: Buffer.concat(chunks) })); }).on('error', reject));
   assert.equal(raw.headers['content-encoding'], 'gzip'); assert.equal(gunzipSync(raw.body).toString(), 'compressed body');
 });
 
 test('the preflight answers what the browser asks, private network access included', async () => {
-  const { base } = await relay({ allowPrivate: true });
+  const { base } = await relay();
   const response = await fetch(`${base}/${TOKEN}/?url=x`, { method: 'OPTIONS', headers: { origin: ORIGIN, 'access-control-request-method': 'PUT', 'access-control-request-headers': 'x-apkweb-cookie, content-type', 'access-control-request-private-network': 'true' } });
   assert.equal(response.status, 204);
   assert.deepEqual([response.headers.get('access-control-allow-methods'), response.headers.get('access-control-allow-headers'), response.headers.get('access-control-allow-private-network'), response.headers.get('access-control-allow-origin')], ['PUT', 'x-apkweb-cookie, content-type', 'true', ORIGIN]);
 });
 
-test('refusals: a wrong token, another page, a bad url; private targets unless allowed; an unreachable target is a 502 with the code the lab maps', async () => {
+test('refusals: a wrong token, another page, a bad url; every destination is reached, this computer included; an unreachable one is a 502 with the code the lab maps', async () => {
   const { base } = await relay();
   assert.equal((await fetch(`${base}/wrong/?url=${encodeURIComponent(target('/'))}`, { headers: { origin: ORIGIN } })).status, 404);
   const other = await fetch(`${base}/${TOKEN}/?url=${encodeURIComponent(target('/'))}`, { headers: { origin: 'https://evil.example' } }); assert.equal(other.status, 403); assert.equal(other.headers.get('access-control-allow-origin'), null);
   assert.equal((await via(base, 'nota url')).status, 400); assert.equal((await via(base, 'file:///etc/passwd')).status, 400);
-  const blocked = await via(base, target('/'));
-  assert.equal(blocked.status, 403); assert.equal(blocked.headers.get('x-apkweb-relay-error-code'), 'APKWEB_RELAY_PRIVATE');
-  const resolved = await relay({ lookup: async () => [{ address: '10.0.0.5' }] });   // a public name that resolves to a private address is refused too
-  assert.equal((await via(resolved.base, 'http://intranet.example.test/')).headers.get('x-apkweb-relay-error-code'), 'APKWEB_RELAY_PRIVATE');
-  const unknown = await relay({ lookup: async () => { throw Object.assign(new Error('getaddrinfo ENOTFOUND nowhere.invalid'), { code: 'ENOTFOUND' }); } });
-  const missing = await via(unknown.base, 'http://nowhere.invalid/');
-  assert.equal(missing.status, 502); assert.equal(missing.headers.get('x-apkweb-relay-error-code'), 'ENOTFOUND'); assert.match(missing.headers.get('access-control-expose-headers'), /x-apkweb-relay-error-code/);
+  const local = await via(base, target('/'));   // a server on this computer, with no option: the relay has no list of forbidden destinations
+  assert.equal(local.status, 200); assert.equal(local.headers.get('x-apkweb-relay-error-code'), null);
   const closed = http.createServer(); const closedPort = await listen(closed); closed.close();
-  const { base: open } = await relay({ allowPrivate: true });
-  const refused = await via(open, `http://127.0.0.1:${closedPort}/`); assert.equal(refused.status, 502); assert.equal(refused.headers.get('x-apkweb-relay-error-code'), 'ECONNREFUSED');
+  const refused = await via(base, `http://127.0.0.1:${closedPort}/`); assert.equal(refused.status, 502); assert.equal(refused.headers.get('x-apkweb-relay-error-code'), 'ECONNREFUSED'); assert.match(refused.headers.get('access-control-expose-headers'), /x-apkweb-relay-error-code/);
 });
 
 test('the status page: only for this computer\'s own names, with the proxy address and the recent requests (no query strings)', async () => {
-  const { base, port, server } = await relay({ allowPrivate: true, port: 9999 });
+  const { base, port, server } = await relay({ port: 9999 });
   await via(base, target('/logged?key=secret'));
   const page = await fetch(`${base}/`); assert.equal(page.status, 200); const html = await page.text();
-  assert.match(html, new RegExp(`http://127\\.0\\.0\\.1:9999/${TOKEN}/\\?url=\\{url\\}`)); assert.match(html, /lab\.example\.test/);
+  assert.match(html, new RegExp(`http://127\\.0\\.0\\.1:9999/${TOKEN}/\\?url=\\{url\\}`)); assert.doesNotMatch(html, /lab\.example\.test|Allowed pages|Páginas que podem usar/, 'the allowed pages are not listed on the status page'); assert.match(html, /reaches any destination/); assert.match(html, /<html lang="en">/);
   const status = await (await fetch(`${base}/status.json`)).json(); assert.equal(status.recent.at(-1).url, target('/logged')); assert.equal(status.recent.at(-1).status, 200);
   assert.ok(!JSON.stringify(server.recent).includes('secret'));
   const rebound = await new Promise(resolve => http.get({ host: '127.0.0.1', port, path: '/', headers: { host: 'attacker.example:80' } }, res => { res.resume(); resolve(res.statusCode); }));
   assert.equal(rebound, 403, 'a page reached through another name (DNS rebinding) gets nothing');
 });
 
-test('private addresses', () => {
-  for (const address of ['127.0.0.1', '10.1.2.3', '172.16.0.1', '172.31.255.255', '192.168.1.1', '169.254.1.1', '100.64.0.1', '0.0.0.0', '::1', '::', 'fd00::1', 'fe80::1', '::ffff:192.168.0.1']) assert.equal(privateAddress(address), true, address);
-  for (const address of ['8.8.8.8', '172.32.0.1', '100.128.0.1', '2001:4860:4860::8888', 'example.com']) assert.equal(privateAddress(address), false, address);
-});
-
 test('settings: the command line over the saved ones, a token kept between runs, the config folder of each system', () => {
-  assert.deepEqual(parseArguments([]), { port: null, origins: [], token: null, newToken: false, allowPrivate: null, open: true });
+  assert.deepEqual(parseArguments([]), { port: null, origins: [], token: null, newToken: false, open: true });
   const parsed = parseArguments(['--port', '9000', '--origin', 'http://localhost:5173/', '--allow-private', '--no-open', '-psn_0_123']);
-  assert.deepEqual([parsed.port, parsed.origins, parsed.allowPrivate, parsed.open], [9000, ['http://localhost:5173'], true, false]);
+  assert.deepEqual([parsed.port, parsed.origins, parsed.open, 'allowPrivate' in parsed], [9000, ['http://localhost:5173'], false, false], '--allow-private (from older versions) is accepted and does nothing');
   for (const bad of [['--port', '0'], ['--port'], ['--origin', 'http://x.example/path'], ['--token', 'a b'], ['--what']]) assert.throws(() => parseArguments(bad), undefined, bad.join(' '));
-  const first = resolveSettings({}, parseArguments([])); assert.match(first.token, /^[0-9a-f]{24}$/); assert.deepEqual([first.port, first.origins, first.allowPrivate], [8787, DEFAULT_ORIGINS, false]);
+  const first = resolveSettings({}, parseArguments([])); assert.match(first.token, /^[0-9a-f]{24}$/); assert.deepEqual([first.port, first.origins, 'allowPrivate' in first], [8787, DEFAULT_ORIGINS, false]);
   assert.equal(resolveSettings(first, parseArguments([])).token, first.token, 'the same address next time');
   assert.notEqual(resolveSettings(first, parseArguments(['--new-token'])).token, first.token);
-  assert.equal(resolveSettings({ ...first, allowPrivate: true }, parseArguments(['--no-allow-private'])).allowPrivate, false);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-test-'));
   try { assert.equal(saveSettings(dir, first), true); assert.deepEqual(loadSettings(dir), first); assert.deepEqual(loadSettings(path.join(dir, 'none')), {}); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   assert.equal(configDir({ APPDATA: 'C:\\Users\\a\\AppData\\Roaming' }, 'win32', 'C:\\Users\\a'), path.join('C:\\Users\\a\\AppData\\Roaming', 'apk-lab-relay'));
@@ -126,16 +114,16 @@ test('the TCP tunnel: a WebSocket on /<token>/tcp connects to the target and cop
     const until = async (check, what) => { for (let i = 0; i < 300; i++) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 10)); } assert.fail(`${what}: ${JSON.stringify(messages)}`); };
     return { socket, messages, until };
   };
-  const { port, server } = await relay({ allowPrivate: true });
+  const { port, server } = await relay();
   const live = open(port, `host=127.0.0.1&port=${targetPort}&tls=0`);
   await live.until(() => live.messages.length, 'connected'); assert.deepEqual(live.messages[0], { connected: true, alpn: null });
   live.socket.send(new TextEncoder().encode('PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'));
   await live.until(() => live.messages.length > 1, 'the echo'); assert.equal(live.messages.slice(1).join(''), '<PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n>');
   assert.equal(server.recent.at(-1).method, 'TCP', 'the status page lists the tunnel');
   live.socket.close();
-  const strict = await relay(), refused = open(strict.port, `host=127.0.0.1&port=${targetPort}`);
-  await refused.until(() => refused.messages.length, 'refused'); assert.equal(refused.messages[0].error.code, 'APKWEB_RELAY_PRIVATE');
+  const plain = await relay(), local = open(plain.port, `host=127.0.0.1&port=${targetPort}`);   // no option needed for this computer
+  await local.until(() => local.messages.length, 'connected without options'); assert.deepEqual(local.messages[0], { connected: true, alpn: null });
   const stranger = new WebSocket(`ws://127.0.0.1:${port}/${TOKEN}/tcp?host=127.0.0.1&port=${targetPort}`, { headers: { origin: 'https://evil.example' } });
   assert.equal(await new Promise(resolve => { stranger.onopen = () => resolve('open'); stranger.onerror = () => resolve('refused'); }), 'refused');
-  refused.socket.close(); target.close(); for (const s of [server, strict.server]) s.closeAllConnections?.();
+  local.socket.close(); target.close(); for (const s of [server, plain.server]) s.closeAllConnections?.();
 });

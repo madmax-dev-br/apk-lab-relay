@@ -22,7 +22,6 @@ const { randomBytes, createHash } = require('node:crypto');
 const net = require('node:net');
 const tls = require('node:tls');
 const { isIP } = net;
-const dns = require('node:dns/promises');
 const { spawn } = require('node:child_process');
 
 const VERSION = '0.2.0';
@@ -34,21 +33,6 @@ const RESPONSE_DROP = new Set(['transfer-encoding', 'connection', 'keep-alive', 
 const MAX_BODY = 32 * 1024 * 1024;
 const RECENT = 50;
 
-/** True for addresses on this computer or the local network: loopback, RFC 1918, link-local, CGNAT, unique-local IPv6, unspecified. */
-function privateAddress(address) {
-  const kind = isIP(address);
-  if (kind === 4) {
-    const [a, b] = address.split('.').map(Number);
-    return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
-  }
-  if (kind === 6) {
-    const v = address.toLowerCase();
-    if (v === '::' || v === '::1') return true;
-    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(v); if (mapped) return privateAddress(mapped[1]);
-    return /^f[cd]/.test(v) || /^fe[89ab]/.test(v);
-  }
-  return false;
-}
 
 /** One upstream exchange over node:http(s), following redirects the way fetch does (at most 20; 303, and 301/302 after a POST, continue as GET without a body). */
 function send(url, method, headers, body, timeoutMs, hops = 0) {
@@ -74,8 +58,8 @@ function send(url, method, headers, body, timeoutMs, hops = 0) {
 }
 
 const escapeHtml = text => String(text).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-function statusPage({ proxyUrl, origins, allowPrivate, port }) {
-  return `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>APK Lab Relay</title>
+function statusPage({ proxyUrl, port }) {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>APK Lab Relay</title>
 <style>
 :root{--bg:#f6f7fb;--card:#fff;--ink:#1d2130;--muted:#667085;--line:#e3e6ee;--accent:#4f46e5;--ok:#1a7f4b;--bad:#b42318}
 @media (prefers-color-scheme:dark){:root{--bg:#0f1117;--card:#171a23;--ink:#e6e8ef;--muted:#98a0b3;--line:#272b38;--accent:#8b84ff;--ok:#4cc38a;--bad:#ff7b72}}
@@ -88,14 +72,13 @@ ul{margin:0;padding-left:18px}table{width:100%;border-collapse:collapse;font-siz
 td.url-cell{white-space:normal;word-break:break-all}.ok{color:var(--ok)}.bad{color:var(--bad)}.empty{color:var(--muted)}
 </style></head><body><main>
 <h1>APK Lab Relay ${VERSION}</h1>
-<p>Rodando em 127.0.0.1:${port}. Enquanto este programa estiver aberto, o APK Browser Lab alcança qualquer servidor sem erro de CORS.</p>
-<section><h2>Endereço para o campo Proxy</h2><p>No lab: Controles › Dispositivo › Proxy. Cole o endereço abaixo.</p>
-<div class="url"><input id="proxy" readonly value="${escapeHtml(proxyUrl)}" aria-label="Endereço do proxy"><button id="copy" type="button">Copiar</button></div></section>
-<section><h2>Páginas que podem usar o relay</h2><ul>${origins.map(origin => `<li>${escapeHtml(origin)}</li>`).join('')}</ul>
-<p style="margin-top:10px">Destinos na rede local: ${allowPrivate ? 'permitidos' : 'bloqueados (inicie com --allow-private para liberar)'}.</p></section>
-<section><h2>Últimas requisições</h2><table><thead><tr><th>Hora</th><th>Método</th><th>Status</th><th>ms</th><th>Destino</th></tr></thead><tbody id="log"><tr><td colspan="5" class="empty">Nenhuma ainda.</td></tr></tbody></table></section>
+<p>Running on 127.0.0.1:${port}. While this program is open, APK Browser Lab reaches any server without CORS errors.</p>
+<section><h2>Address for the Proxy field</h2><p>In the lab: Controls › Device › Proxy. Paste the address below.</p>
+<div class="url"><input id="proxy" readonly value="${escapeHtml(proxyUrl)}" aria-label="Proxy address"><button id="copy" type="button">Copy</button></div>
+<p style="margin:10px 0 0">The relay reaches any destination: the internet, this computer and the local network.</p></section>
+<section><h2>Recent requests</h2><table><thead><tr><th>Time</th><th>Method</th><th>Status</th><th>ms</th><th>Destination</th></tr></thead><tbody id="log"><tr><td colspan="5" class="empty">None yet.</td></tr></tbody></table></section>
 </main><script>
-document.getElementById('copy').addEventListener('click', async () => { const input = document.getElementById('proxy'); try { await navigator.clipboard.writeText(input.value); } catch { input.select(); document.execCommand('copy'); } document.getElementById('copy').textContent = 'Copiado'; setTimeout(() => { document.getElementById('copy').textContent = 'Copiar'; }, 1500); });
+document.getElementById('copy').addEventListener('click', async () => { const input = document.getElementById('proxy'); try { await navigator.clipboard.writeText(input.value); } catch { input.select(); document.execCommand('copy'); } document.getElementById('copy').textContent = 'Copied'; setTimeout(() => { document.getElementById('copy').textContent = 'Copy'; }, 1500); });
 const cell = (text, cls) => { const td = document.createElement('td'); td.textContent = text; if (cls) td.className = cls; return td; };
 async function refresh() {
   try {
@@ -109,10 +92,9 @@ refresh(); setInterval(refresh, 2000);
 }
 
 /**
- * The relay as an http.Server (not listening yet). `token`: the path segment every relayed request must carry; `origins`: the page origins allowed to use it; `allowPrivate`: also
- * relay to private addresses; `lookup`: injectable for tests; `port`: for the status page's texts. `server.recent` keeps the last requests (method, target, status, time) for the page.
+ * The relay as an http.Server (not listening yet). `token`: the path segment every relayed request must carry; `origins`: the page origins allowed to use it; `port`: for the status page's texts. `server.recent` keeps the last requests (method, target, status, time) for the page.
  */
-function createRelay({ token, origins = DEFAULT_ORIGINS, allowPrivate = false, lookup = dns.lookup, timeoutMs = 60000, port = DEFAULT_PORT } = {}) {
+function createRelay({ token, origins = DEFAULT_ORIGINS, timeoutMs = 60000, port = DEFAULT_PORT } = {}) {
   if (!token) throw new Error('createRelay needs a token');
   const allowed = new Set(origins.map(origin => origin.replace(/\/$/, '')));
   const recent = [];
@@ -130,7 +112,7 @@ function createRelay({ token, origins = DEFAULT_ORIGINS, allowPrivate = false, l
       res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Frame-Options', 'DENY'); res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'");
       if (url.pathname === '/status.json') { res.setHeader('Content-Type', 'application/json'); return res.end(JSON.stringify({ version: VERSION, recent })); }
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      return res.end(statusPage({ proxyUrl: `http://127.0.0.1:${port}/${token}/?url={url}`, origins: [...allowed], allowPrivate, port }));
+      return res.end(statusPage({ proxyUrl: `http://127.0.0.1:${port}/${token}/?url={url}`, port }));
     }
     if (url.pathname !== `/${token}/` && url.pathname !== `/${token}`) return fail(res, 404, 'unknown path');
     if (!allowed.has(origin)) return fail(res, 403, `origin not allowed: ${origin || '(none)'}; start the relay with --origin ${origin || '<origin>'}`);
@@ -143,16 +125,6 @@ function createRelay({ token, origins = DEFAULT_ORIGINS, allowPrivate = false, l
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') { cors(origin, res); return fail(res, 400, `unsupported scheme ${parsed.protocol}`); }
     const shown = `${parsed.protocol}//${parsed.host}${parsed.pathname}`;   // the log keeps no query string (it may carry keys or tokens)
     const relayError = (code, message) => { note({ method: req.method, url: shown, status: 502, error: code, ms: Date.now() - started }); cors(origin, res, { 'x-apkweb-relay-error-code': code, 'x-apkweb-relay-error': message.replace(/[\r\n]+/g, ' ').slice(0, 300), 'Access-Control-Expose-Headers': 'x-apkweb-relay-error-code, x-apkweb-relay-error' }); fail(res, 502, `${code}: ${message}`); };
-    if (!allowPrivate) {
-      const host = parsed.hostname.replace(/^\[|\]$/g, '');
-      let addresses;
-      try { addresses = isIP(host) ? [{ address: host }] : await lookup(host, { all: true }); } catch (error) { return relayError(error.code ?? 'ENOTFOUND', error.message ?? String(error)); }
-      if (addresses.some(entry => privateAddress(entry.address))) {   // named in the relay-error headers too, so the lab reports it as a connect failure instead of handing the app a 403
-        const message = `${host} is on this machine or the local network; start the relay with --allow-private to reach it`;
-        note({ method: req.method, url: shown, status: 403, error: 'APKWEB_RELAY_PRIVATE', ms: Date.now() - started });
-        cors(origin, res, { 'x-apkweb-relay-error-code': 'APKWEB_RELAY_PRIVATE', 'x-apkweb-relay-error': message, 'Access-Control-Expose-Headers': 'x-apkweb-relay-error-code, x-apkweb-relay-error' }); return fail(res, 403, message);
-      }
-    }
     const headers = new Headers();
     for (const [name, value] of Object.entries(req.headers)) {
       const lower = name.toLowerCase(), values = Array.isArray(value) ? value : [value];
@@ -180,7 +152,7 @@ function createRelay({ token, origins = DEFAULT_ORIGINS, allowPrivate = false, l
     response.on('error', () => res.destroy()).pipe(res);
   });
   server.recent = recent;
-  server.on('upgrade', (req, socket) => tunnel({ req, socket, token, allowed, allowPrivate, lookup, timeoutMs, note }));
+  server.on('upgrade', (req, socket) => tunnel({ req, socket, token, allowed, timeoutMs, note }));
   return server;
 }
 
@@ -213,7 +185,7 @@ function wsDecoder() {
     return out;
   };
 }
-async function tunnel({ req, socket, token, allowed, allowPrivate, lookup, timeoutMs, note = () => {} }) {
+async function tunnel({ req, socket, token, allowed, timeoutMs, note = () => {} }) {
   const url = new URL(req.url, 'http://relay.invalid'), origin = req.headers.origin ?? '';
   const refuse = (status, text, message) => { socket.end(`HTTP/1.1 ${status} ${text}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n${message}`); };
   if (url.pathname !== `/${token}/tcp`) return refuse(404, 'Not Found', 'unknown path');
@@ -227,11 +199,6 @@ async function tunnel({ req, socket, token, allowed, allowPrivate, lookup, timeo
   const closeFrame = code => wsFrame(0x8, Buffer.from([code >> 8, code & 255]));
   const fail = (code, message) => { say({ error: { code, message: String(message).replace(/[\r\n]+/g, ' ').slice(0, 300) } }); socket.end(closeFrame(1011)); };
   socket.on('error', () => {});
-  if (!allowPrivate) {
-    const name = host.replace(/^\[|\]$/g, '');
-    let addresses; try { addresses = isIP(name) ? [{ address: name }] : await lookup(name, { all: true }); } catch (error) { return fail(error.code ?? 'ENOTFOUND', error.message ?? String(error)); }
-    if (addresses.some(entry => privateAddress(entry.address))) return fail('APKWEB_RELAY_PRIVATE', `${name} is on this machine or the local network; start the relay with --allow-private to reach it`);
-  }
   let connected = false; const started = Date.now();
   const upstream = secure ? tls.connect({ host, port, servername: isIP(host) ? undefined : host, ALPNProtocols: alpn.length ? alpn : undefined }) : net.connect({ host, port });
   const timer = setTimeout(() => { if (!connected) { upstream.destroy(); fail('ETIMEDOUT', `connect to ${host}:${port} timed out after ${timeoutMs} ms`); } }, timeoutMs);
@@ -265,48 +232,45 @@ function loadSettings(dir) {
 function saveSettings(dir, settings) {
   try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(settings, null, 2) + '\n', { mode: 0o600 }); return true; } catch { return false; }
 }
-const HELP = `APK Lab Relay ${VERSION}: requisições do APK Browser Lab sem erro de CORS.
+const HELP = `APK Lab Relay ${VERSION}: APK Browser Lab requests without CORS errors.
 
-Uso: apk-lab-relay [opções]
-  --port <n>           porta em 127.0.0.1 (padrão ${DEFAULT_PORT}; fica salva)
-  --origin <url>       página que pode usar o relay (repita para várias; fica salva; padrão: o lab publicado e uma cópia local)
-  --allow-private      permite destinos neste computador e na rede local (fica salvo; --no-allow-private desliga)
-  --token <texto>      usa este token no endereço (fica salvo)
-  --new-token          gera um token novo (o endereço do Proxy muda)
-  --no-open            não abre o navegador na página de status
+Usage: apk-lab-relay [options]
+  --port <n>           port on 127.0.0.1 (default ${DEFAULT_PORT}; saved)
+  --origin <url>       a page that may use the relay (repeat for several; saved; default: the published lab and a local copy)
+  --token <text>       use this token in the address (saved)
+  --new-token          make a new token (the Proxy address changes)
+  --no-open            do not open the status page in the browser
   --version, --help`;
 function parseArguments(argv) {
-  const options = { port: null, origins: [], token: null, newToken: false, allowPrivate: null, open: true };
+  const options = { port: null, origins: [], token: null, newToken: false, open: true };
   for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i], value = () => { if (i + 1 >= argv.length) throw new Error(`${arg} precisa de um valor`); return argv[++i]; };
+    const arg = argv[i], value = () => { if (i + 1 >= argv.length) throw new Error(`${arg} needs a value`); return argv[++i]; };
     if (arg === '--port') options.port = Number(value());
     else if (arg === '--origin') options.origins.push(value().replace(/\/$/, ''));
     else if (arg === '--token') options.token = value();
     else if (arg === '--new-token') options.newToken = true;
-    else if (arg === '--allow-private') options.allowPrivate = true;
-    else if (arg === '--no-allow-private') options.allowPrivate = false;
+    else if (arg === '--allow-private' || arg === '--no-allow-private') continue;   // older versions blocked private destinations; every destination is reachable now, so the option does nothing
     else if (arg === '--no-open') options.open = false;
     else if (arg === '--help' || arg === '-h') options.help = true;
     else if (arg === '--version' || arg === '-v') options.version = true;
     else if (arg.startsWith('-psn_')) continue;   // macOS adds a process serial number when the app is opened from Finder
-    else throw new Error(`opção desconhecida: ${arg}`);
+    else throw new Error(`unknown option: ${arg}`);
   }
-  if (options.port !== null && (!Number.isInteger(options.port) || options.port < 1 || options.port > 65535)) throw new Error('--port precisa ser de 1 a 65535');
-  if (options.token !== null && !/^[A-Za-z0-9_-]{8,128}$/.test(options.token)) throw new Error('--token: 8 a 128 letras, números, _ ou -');
-  for (const origin of options.origins) { let parsed; try { parsed = new URL(origin); } catch { throw new Error(`--origin inválida: ${origin}`); } if (parsed.origin !== origin) throw new Error(`--origin precisa ser só esquema, host e porta (ex.: ${parsed.origin})`); }
+  if (options.port !== null && (!Number.isInteger(options.port) || options.port < 1 || options.port > 65535)) throw new Error('--port must be 1 to 65535');
+  if (options.token !== null && !/^[A-Za-z0-9_-]{8,128}$/.test(options.token)) throw new Error('--token: 8 to 128 letters, digits, _ or -');
+  for (const origin of options.origins) { let parsed; try { parsed = new URL(origin); } catch { throw new Error(`invalid --origin: ${origin}`); } if (parsed.origin !== origin) throw new Error(`--origin must be only scheme, host and port (e.g. ${parsed.origin})`); }
   return options;
 }
 /** The settings of this run: saved ones, overridden by the command line (which is saved for the next runs). */
 function resolveSettings(saved, options) {
   const token = options.token ?? (options.newToken || typeof saved.token !== 'string' || !/^[A-Za-z0-9_-]{8,128}$/.test(saved.token) ? randomBytes(12).toString('hex') : saved.token);
-  return { token, port: options.port ?? (Number.isInteger(saved.port) ? saved.port : DEFAULT_PORT), origins: options.origins.length ? options.origins : Array.isArray(saved.origins) && saved.origins.length ? saved.origins.map(String) : DEFAULT_ORIGINS,
-    allowPrivate: options.allowPrivate ?? saved.allowPrivate === true };
+  return { token, port: options.port ?? (Number.isInteger(saved.port) ? saved.port : DEFAULT_PORT), origins: options.origins.length ? options.origins : Array.isArray(saved.origins) && saved.origins.length ? saved.origins.map(String) : DEFAULT_ORIGINS };
 }
 function openBrowser(url) {
   const [command, args] = process.platform === 'darwin' ? ['open', [url]] : process.platform === 'win32' ? ['cmd', ['/c', 'start', '""', url]] : ['xdg-open', [url]];
   try { const child = spawn(command, args, { stdio: 'ignore', detached: true, windowsHide: true }); child.on('error', () => {}); child.unref(); } catch { /* no browser to open: the address is printed */ }
 }
-const pause = () => new Promise(resolve => { if (!process.stdin.isTTY) return resolve(); process.stdout.write('\nPressione Enter para sair.'); process.stdin.resume(); process.stdin.once('data', () => resolve()); });
+const pause = () => new Promise(resolve => { if (!process.stdin.isTTY) return resolve(); process.stdout.write('\nPress Enter to exit.'); process.stdin.resume(); process.stdin.once('data', () => resolve()); });
 
 async function main(argv = process.argv.slice(2)) {
   let options;
@@ -315,28 +279,28 @@ async function main(argv = process.argv.slice(2)) {
   if (options.version) { console.log(VERSION); return; }
   const dir = configDir(), settings = resolveSettings(loadSettings(dir), options);
   const saved = saveSettings(dir, settings);
-  const server = createRelay({ token: settings.token, origins: settings.origins, allowPrivate: settings.allowPrivate, port: settings.port });
+  const server = createRelay({ token: settings.token, origins: settings.origins, port: settings.port });
   const page = `http://127.0.0.1:${settings.port}/`, proxyUrl = `http://127.0.0.1:${settings.port}/${settings.token}/?url={url}`;
   server.on('error', async error => {
     if (error.code === 'EADDRINUSE') {
-      console.error(`A porta ${settings.port} já está em uso. Se for outro APK Lab Relay aberto, use aquele (${page}); senão, inicie com --port <outra>.`);
+      console.error(`Port ${settings.port} is already in use. If it is another APK Lab Relay, use that one (${page}); otherwise start with --port <another>.`);
       if (options.open) openBrowser(page);
-    } else console.error(`Não foi possível iniciar: ${error.message}`);
+    } else console.error(`Could not start: ${error.message}`);
     await pause(); process.exit(1);
   });
   server.listen(settings.port, '127.0.0.1', () => {
-    console.log(`APK Lab Relay ${VERSION} em http://127.0.0.1:${settings.port} (só este computador alcança)`);
-    console.log(`Páginas permitidas: ${settings.origins.join(', ')}`);
-    console.log(`Destinos na rede local: ${settings.allowPrivate ? 'permitidos' : 'bloqueados'}`);
-    console.log(`\nCole no campo Proxy do lab (Controles > Dispositivo > Proxy):\n  ${proxyUrl}\n`);
-    console.log(`Página de status: ${page}${saved ? '' : '\n(as configurações não puderam ser salvas: o token muda na próxima vez)'}`);
-    console.log('Deixe esta janela aberta enquanto usa o lab. Ctrl+C encerra.');
+    console.log(`APK Lab Relay ${VERSION} on http://127.0.0.1:${settings.port} (only this computer can reach it)`);
+    console.log(`Allowed pages: ${settings.origins.join(', ')}`);
+    console.log('Destinations: any (the internet, this computer and the local network)');
+    console.log(`\nPaste into the lab's Proxy field (Controls > Device > Proxy):\n  ${proxyUrl}\n`);
+    console.log(`Status page: ${page}${saved ? '' : '\n(the settings could not be saved: the token changes next time)'}`);
+    console.log('Keep this window open while you use the lab. Ctrl+C stops it.');
     if (options.open) openBrowser(page);
   });
   const stop = () => { server.close(); process.exit(0); };
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
 }
 
-module.exports = { VERSION, DEFAULT_PORT, DEFAULT_ORIGINS, privateAddress, createRelay, configDir, loadSettings, saveSettings, parseArguments, resolveSettings, main };
+module.exports = { VERSION, DEFAULT_PORT, DEFAULT_ORIGINS, createRelay, configDir, loadSettings, saveSettings, parseArguments, resolveSettings, main };
 const isSea = (() => { try { return require('node:sea').isSea(); } catch { return false; } })();   // the single executable built by scripts/build-sea.mjs
 if (isSea || require.main === module) main();

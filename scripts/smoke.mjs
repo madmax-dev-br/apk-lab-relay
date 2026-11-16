@@ -23,6 +23,6 @@ try {
   const page = await (await fetch(`http://127.0.0.1:${port}/`)).text();
   if (!page.includes(`http://127.0.0.1:${port}/smoke-token-1/?url={url}`)) throw new Error('the status page does not show the proxy address');
   const refused = await fetch(`http://127.0.0.1:${port}/smoke-token-1/?url=${encodeURIComponent('http://127.0.0.1:9/')}`, { headers: { origin: 'https://madmax-dev-br.github.io' } });
-  if (refused.headers.get('x-apkweb-relay-error-code') !== 'APKWEB_RELAY_PRIVATE') throw new Error(`a private target was not refused: ${refused.status}`);
+  if (refused.headers.get('x-apkweb-relay-error-code') !== 'ECONNREFUSED') throw new Error(`a target on this computer was not tried (every destination is reachable): ${refused.status} ${refused.headers.get('x-apkweb-relay-error-code')}`);
   console.log(`smoke test passed: ${exe} ${VERSION} on port ${port}`);
 } finally { child.kill(); await new Promise(resolve => setTimeout(resolve, 300)); try { rmSync(home, { recursive: true, force: true }); } catch { /* still in use on Windows */ } }
