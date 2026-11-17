@@ -26,7 +26,7 @@ const tls = require('node:tls');
 const { isIP } = net;
 const { spawn } = require('node:child_process');
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const DEFAULT_PORT = 8787;
 const DEFAULT_ORIGINS = ['https://madmax-dev-br.github.io', 'http://127.0.0.1:8765', 'http://localhost:8765'];
 const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'host', 'content-length', 'expect']);
