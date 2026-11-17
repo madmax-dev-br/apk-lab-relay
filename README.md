@@ -1,3 +1,5 @@
+<img src="assets/icon-512.png" alt="APK Lab Relay icon" width="96" height="96">
+
 # APK Lab Relay
 
 A small program for Windows, Linux and macOS that lets the [APK Browser Lab](https://madmax-dev-br.github.io/apk-browser-lab-site/) reach any server without CORS errors.
