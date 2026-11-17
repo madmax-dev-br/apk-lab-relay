@@ -93,6 +93,10 @@ npm run smoke      # tests the built executable
 CI (`.github/workflows/build.yml`) runs the tests and builds the executables for the five systems on every push. To publish a version:
 
 1. Change the version in `package.json` and `VERSION` in `src/relay.cjs`.
-2. Commit and create the tag: `git tag v0.2.0 && git push origin main v0.2.0`.
+2. Commit and create the tag: `git tag v0.3.0 && git push origin main v0.3.0`.
 
 CI creates the release with the executables and the checksums.
+
+## License
+
+APK Lab Relay is free software under the [MIT License](LICENSE): use it, copy it, change it, share it or sell it, for any purpose, keeping the copyright notice.

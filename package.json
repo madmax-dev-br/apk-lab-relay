@@ -1,6 +1,7 @@
 {
   "name": "apk-lab-relay",
   "version": "0.3.0",
+  "license": "MIT",
   "description": "Desktop CORS relay for APK Browser Lab: lets the lab reach any server without CORS errors.",
   "private": true,
   "main": "src/relay.cjs",
