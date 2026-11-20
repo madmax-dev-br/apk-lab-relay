@@ -64,7 +64,7 @@ Settings live in `%APPDATA%\apk-lab-relay` (Windows), `~/Library/Application Sup
 
 ## How it works
 
-It is the same protocol as the lab's `cors-relay.mjs`:
+It is the same protocol as the lab's `cors-relay.mjs` (version 0.4.0):
 
 - The destination goes in the `url` parameter.
 - Headers the browser will not send (Cookie, User-Agent, Origin, Referer...) arrive as `x-apkweb-<name>` and leave under their original name.
@@ -75,6 +75,26 @@ It is the same protocol as the lab's `cors-relay.mjs`:
 ## TCP tunnel (gRPC, HTTP/2, other protocols)
 
 Since 0.2.0 the relay also opens TCP connections for the lab. When an app speaks something other than HTTP/1.1 on a socket (Cloud Firestore's gRPC uses HTTP/2; MQTT; database protocols), the lab sends that connection through the relay: the page opens a WebSocket at `ws://127.0.0.1:8787/<token>/tcp?host=…&port=…`, and the relay connects to the destination from your computer and passes the bytes both ways. The same rules apply as for the rest: only the allowed pages, only with the token. Any destination is reachable, including emulators running on your computer (for example the Firebase emulators).
+
+## Parallel channel (since 0.4.0)
+
+Without it, every request the app makes is a separate browser request to the relay. The browser opens at most about 6 connections to one address, so an app that fires 20 or 50 requests at once gets them answered 6 at a time, and most requests also cost a CORS preflight first. With the lab's **Controls › Device › Parallel relay channel** switch on (off by default), the lab opens one WebSocket to `ws://127.0.0.1:8787/<token>/mux` and sends every request over it at once; the relay runs them concurrently from your computer, keeping connections to each server alive. Measured in Chrome with a server that answers after 100 ms: 20 requests at once took 410 ms as separate requests and 104 ms over the channel; 50 took 925 ms and 106 ms.
+
+Nothing else changes: each request through the channel is decided by the same code as a separate request (the headers, redirects, `Set-Cookie`, the error codes, the timeouts), and the lab gets the same status, headers and bytes. A relay older than 0.4.0 refuses the channel, and the lab then sends separate requests as before. The same rules apply: only the allowed pages, only with the token.
+
+The protocol, version 1. Text messages are JSON; binary messages carry body bytes as `[kind: 1 byte][exchange id: 4 bytes, big-endian][bytes]` (kind 1: request body, from the lab; kind 2: response body, from the relay).
+
+| Direction | Message | Meaning |
+| --- | --- | --- |
+| relay → lab | `{"t":"hello","v":1,"window":262144,"maxBody":33554432,"frame":65536}` | first message: the relay has the channel |
+| lab → relay | `{"t":"req","id":1,"method":"GET","query":"?url=…","headers":[["name","value"]],"length":0}` | a request: the same query and headers as a separate request (`x-apkweb-<name>` for the headers a browser may not send); then `length` body bytes in kind-1 frames |
+| relay → lab | `{"t":"head","id":1,"status":200,"statusText":"OK","headers":[…]}` | the response head, with the headers a separate request would show (`x-apkweb-set-cookie` included) |
+| relay → lab | kind-2 frames, then `{"t":"end","id":1}` | the body. A `Content-Encoding` the browser would decode (gzip, deflate, br, zstd) is decoded first, so the lab gets the bytes it would have got; nothing is compressed or cached |
+| relay → lab | `{"t":"error","id":1,"code":"ECONNREFUSED","message":"…"}` | the destination could not be reached (before the head: the same codes as the 502 `x-apkweb-relay-error-code`), or the body broke |
+| lab → relay | `{"t":"credit","id":1,"n":65536}` | flow control: the relay sends at most `window` body bytes ahead of what the lab has read, and pauses that destination until more credit comes |
+| lab → relay | `{"t":"abort","id":1}` | the app closed the request: the relay cancels it at the destination |
+
+The status page shows how many channels are open and marks the requests that came over one.
 
 ## Develop
 
