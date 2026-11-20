@@ -9,6 +9,8 @@
 //  - Set-Cookie, which a browser never exposes, comes back as `x-apkweb-set-cookie`: a JSON array of the Set-Cookie values;
 //  - a failure to reach the target is a 502 with `x-apkweb-relay-error-code` (ENOTFOUND, ECONNREFUSED, ETIMEDOUT, ECONNRESET, CERT_..., the codes Node uses) and
 //    `x-apkweb-relay-error`, which the lab turns into the exception an Android device would throw (UnknownHostException, ConnectException, SSLHandshakeException ...).
+//  - the parallel channel (since 0.4.0; /<token>/mux, a WebSocket; the lab's Device > "Parallel relay channel"): many exchanges at once over one connection, multiplexed by id,
+//    each decided by the same code as the per-request path, with a credit window per exchange (protocol at muxChannel below and in README.md).
 //
 // Safety: it listens on 127.0.0.1 only; every relayed request must carry the random token in its path and come from one of the allowed page origins, so another site open in the
 // same browser cannot use it. Targets on this computer or the local network are refused unless "allow private" is on. Nothing is stored but the settings (token, port, origins):
@@ -23,10 +25,12 @@ const path = require('node:path');
 const { randomBytes, createHash } = require('node:crypto');
 const net = require('node:net');
 const tls = require('node:tls');
+const zlib = require('node:zlib');
+const { Readable } = require('node:stream');
 const { isIP } = net;
 const { spawn } = require('node:child_process');
 
-const VERSION = '0.3.1';
+const VERSION = '0.4.0';
 const DEFAULT_PORT = 8787;
 const DEFAULT_ORIGINS = ['https://madmax-dev-br.github.io', 'http://127.0.0.1:8765', 'http://localhost:8765'];
 const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'host', 'content-length', 'expect']);
@@ -37,11 +41,12 @@ const RECENT = 50;
 
 
 /** One upstream exchange over node:http(s), following redirects the way fetch does (at most 20; 303, and 301/302 after a POST, continue as GET without a body). */
-function send(url, method, headers, body, timeoutMs, hops = 0) {
+function send(url, method, headers, body, timeoutMs, hops = 0, transport = {}) {
   return new Promise((resolve, reject) => {
     const outgoing = {}; headers.forEach((value, name) => { outgoing[name] = name.toLowerCase() === 'cookie' ? value : (outgoing[name] ? `${outgoing[name]}, ${value}` : value); });
     if (body) outgoing['content-length'] = String(body.length);
-    const request = (url.protocol === 'https:' ? https : http).request(url, { method, headers: outgoing, timeout: timeoutMs }, response => {
+    const agent = transport.agents?.[url.protocol];   // keep-alive connections per destination
+    const request = (url.protocol === 'https:' ? https : http).request(url, { method, headers: outgoing, timeout: timeoutMs, ...(agent ? { agent } : {}), ...(transport.signal ? { signal: transport.signal } : {}) }, response => {
       const status = response.statusCode, location = response.headers.location;
       if ([301, 302, 303, 307, 308].includes(status) && location) {
         response.resume();
@@ -49,7 +54,7 @@ function send(url, method, headers, body, timeoutMs, hops = 0) {
         const next = new URL(location, url), asGet = status === 303 || ((status === 301 || status === 302) && method === 'POST');
         const nextHeaders = new Headers(headers); if (asGet) { nextHeaders.delete('content-type'); nextHeaders.delete('content-length'); }
         if (next.host !== url.host) { nextHeaders.delete('authorization'); nextHeaders.delete('cookie'); }
-        return resolve(send(next, asGet ? 'GET' : method, nextHeaders, asGet ? undefined : body, timeoutMs, hops + 1));
+        return resolve(send(next, asGet ? 'GET' : method, nextHeaders, asGet ? undefined : body, timeoutMs, hops + 1, transport));
       }
       resolve(response);
     });
@@ -78,15 +83,16 @@ td.url-cell{white-space:normal;word-break:break-all}.ok{color:var(--ok)}.bad{col
 <section><h2>Address for the Proxy field</h2><p>In the lab: Controls › Device › Proxy. Paste the address below.</p>
 <div class="url"><input id="proxy" readonly value="${escapeHtml(proxyUrl)}" aria-label="Proxy address"><button id="copy" type="button">Copy</button></div>
 <p style="margin:10px 0 0">The relay reaches any destination: the internet, this computer and the local network.</p></section>
-<section><h2>Recent requests</h2><table><thead><tr><th>Time</th><th>Method</th><th>Status</th><th>ms</th><th>Destination</th></tr></thead><tbody id="log"><tr><td colspan="5" class="empty">None yet.</td></tr></tbody></table></section>
+<section><h2>Recent requests</h2><p id="channels" style="margin:0 0 10px">Parallel channel: none open (the lab's Device › Parallel relay channel switch opens one).</p><table><thead><tr><th>Time</th><th>Method</th><th>Status</th><th>ms</th><th>Via</th><th>Destination</th></tr></thead><tbody id="log"><tr><td colspan="6" class="empty">None yet.</td></tr></tbody></table></section>
 </main><script>
 document.getElementById('copy').addEventListener('click', async () => { const input = document.getElementById('proxy'); try { await navigator.clipboard.writeText(input.value); } catch { input.select(); document.execCommand('copy'); } document.getElementById('copy').textContent = 'Copied'; setTimeout(() => { document.getElementById('copy').textContent = 'Copy'; }, 1500); });
 const cell = (text, cls) => { const td = document.createElement('td'); td.textContent = text; if (cls) td.className = cls; return td; };
 async function refresh() {
   try {
     const data = await (await fetch('/status.json', { cache: 'no-store' })).json(), body = document.getElementById('log');
+    document.getElementById('channels').textContent = data.channels ? 'Parallel channel: ' + data.channels + ' open (one WebSocket per lab page carries all its requests at once).' : 'Parallel channel: none open (the lab\'s Device › Parallel relay channel switch opens one).';
     if (!data.recent.length) return;
-    body.replaceChildren(...data.recent.slice().reverse().map(item => { const tr = document.createElement('tr'); tr.append(cell(new Date(item.at).toLocaleTimeString()), cell(item.method), cell(item.error || String(item.status), item.error || item.status >= 400 ? 'bad' : 'ok'), cell(String(item.ms)), cell(item.url, 'url-cell')); return tr; }));
+    body.replaceChildren(...data.recent.slice().reverse().map(item => { const tr = document.createElement('tr'); tr.append(cell(new Date(item.at).toLocaleTimeString()), cell(item.method), cell(item.error || String(item.status), item.error || item.status >= 400 ? 'bad' : 'ok'), cell(String(item.ms)), cell(item.via === 'channel' ? 'channel' : item.method === 'TCP' ? 'tunnel' : 'request'), cell(item.url, 'url-cell')); return tr; }));
   } catch {}
 }
 refresh(); setInterval(refresh, 2000);
@@ -99,6 +105,8 @@ refresh(); setInterval(refresh, 2000);
 function createRelay({ token, origins = DEFAULT_ORIGINS, timeoutMs = 60000, port = DEFAULT_PORT } = {}) {
   if (!token) throw new Error('createRelay needs a token');
   const allowed = new Set(origins.map(origin => origin.replace(/\/$/, '')));
+  const agents = keepAliveAgents(), transport = { agents };   // upstream connections kept alive per destination, for the per-request path and the channel alike
+  const sessions = new Set();   // the open channels
   const recent = [];
   const note = item => { recent.push({ at: Date.now(), ...item }); if (recent.length > RECENT) recent.splice(0, recent.length - RECENT); };
   const cors = (origin, res, extra = {}) => { res.setHeader('Access-Control-Allow-Origin', origin); res.setHeader('Vary', 'Origin'); for (const [name, value] of Object.entries(extra)) res.setHeader(name, value); };
@@ -112,7 +120,7 @@ function createRelay({ token, origins = DEFAULT_ORIGINS, timeoutMs = 60000, port
       if (host !== '127.0.0.1' && host !== 'localhost' && host !== '[::1]') return fail(res, 403, 'forbidden host');
       if (req.method !== 'GET' && req.method !== 'HEAD') return fail(res, 405, 'method not allowed');
       res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Frame-Options', 'DENY'); res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'");
-      if (url.pathname === '/status.json') { res.setHeader('Content-Type', 'application/json'); return res.end(JSON.stringify({ version: VERSION, recent })); }
+      if (url.pathname === '/status.json') { res.setHeader('Content-Type', 'application/json'); return res.end(JSON.stringify({ version: VERSION, channels: sessions.size, recent })); }
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       return res.end(statusPage({ proxyUrl: `http://127.0.0.1:${port}/${token}/?url={url}`, port }));
     }
@@ -127,13 +135,7 @@ function createRelay({ token, origins = DEFAULT_ORIGINS, timeoutMs = 60000, port
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') { cors(origin, res); return fail(res, 400, `unsupported scheme ${parsed.protocol}`); }
     const shown = `${parsed.protocol}//${parsed.host}${parsed.pathname}`;   // the log keeps no query string (it may carry keys or tokens)
     const relayError = (code, message) => { note({ method: req.method, url: shown, status: 502, error: code, ms: Date.now() - started }); cors(origin, res, { 'x-apkweb-relay-error-code': code, 'x-apkweb-relay-error': message.replace(/[\r\n]+/g, ' ').slice(0, 300), 'Access-Control-Expose-Headers': 'x-apkweb-relay-error-code, x-apkweb-relay-error' }); fail(res, 502, `${code}: ${message}`); };
-    const headers = new Headers();
-    for (const [name, value] of Object.entries(req.headers)) {
-      const lower = name.toLowerCase(), values = Array.isArray(value) ? value : [value];
-      if (lower.startsWith('x-apkweb-')) { const original = lower.slice('x-apkweb-'.length); if (original !== 'accept-encoding' && !HOP_BY_HOP.has(original)) for (const v of values) headers.append(original, v); continue; }
-      if (HOP_BY_HOP.has(lower) || FROM_BROWSER.has(lower) || lower.startsWith('sec-') || lower.startsWith('access-control-')) continue;
-      for (const v of values) headers.append(name, v);
-    }
+    const headers = upstreamHeaders(Object.entries(req.headers));
     let body;
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       const chunks = []; let size = 0;
@@ -141,7 +143,7 @@ function createRelay({ token, origins = DEFAULT_ORIGINS, timeoutMs = 60000, port
       body = Buffer.concat(chunks);
     }
     let response;
-    try { response = await send(parsed, req.method, headers, body, timeoutMs); }
+    try { response = await send(parsed, req.method, headers, body, timeoutMs, 0, transport); }
     catch (error) { return relayError(error?.code ?? 'EFETCH', String(error?.message ?? error)); }
     const exposed = [];
     for (const [name, value] of Object.entries(response.headers)) { const lower = name.toLowerCase(); if (RESPONSE_DROP.has(lower) || lower.startsWith('access-control-')) continue; res.setHeader(name, value); exposed.push(name); }
@@ -154,8 +156,54 @@ function createRelay({ token, origins = DEFAULT_ORIGINS, timeoutMs = 60000, port
     response.on('error', () => res.destroy()).pipe(res);
   });
   server.recent = recent;
-  server.on('upgrade', (req, socket) => tunnel({ req, socket, token, allowed, timeoutMs, note }));
+  server.on('upgrade', (req, socket) => {
+    const pathname = new URL(req.url, 'http://relay.invalid').pathname;
+    if (pathname === `/${token}/mux`) return muxChannel({ req, socket, allowed, sessions, answer: exchange => relayAnswer({ ...exchange, timeoutMs, transport }),
+      onExchange: (exchange, outcome) => { let shown = ''; try { const parsed = new URL(exchange.params.get('url') ?? ''); shown = `${parsed.protocol}//${parsed.host}${parsed.pathname}`; } catch { shown = '(invalid url)'; } note({ method: exchange.method, url: shown, status: exchange.status ?? 502, ...(outcome && outcome !== 'aborted' ? { error: outcome } : {}), ...(outcome === 'aborted' ? { error: 'aborted' } : {}), ms: Date.now() - exchange.started, via: 'channel' }); } });
+    return tunnel({ req, socket, token, allowed, timeoutMs, note });
+  });
+  const close = server.close.bind(server);   // an upgraded socket keeps the server open, so close() ends the channels and the kept-alive upstream connections first
+  server.close = callback => { for (const socket of sessions) socket.destroy(); for (const agent of Object.values(agents)) agent.destroy(); return close(callback); };
+  server.channelCount = () => sessions.size;
+  server.closeChannels = () => { for (const socket of sessions) socket.destroy(); };
   return server;
+}
+
+/** One keep-alive agent per scheme: Node pools its connections per destination (host:port), so the exchanges to one server reuse their TCP (and TLS) connections. */
+function keepAliveAgents() { return { 'http:': new http.Agent({ keepAlive: true }), 'https:': new https.Agent({ keepAlive: true }) }; }
+/**
+ * The headers the target gets, from the headers the lab sent ([name, value] entries, a value may be an array): the app's own, the ones a browser may not send restored from
+ * `x-apkweb-<name>`, none of the browser's (Origin, Referer, Sec-*, its Cookie and User-Agent) and no hop-by-hop header. The same rule for the per-request path and the channel.
+ */
+function upstreamHeaders(entries) {
+  const headers = new Headers();
+  for (const [name, value] of entries) {
+    const lower = String(name).toLowerCase(), values = Array.isArray(value) ? value : [value];
+    if (lower.startsWith('x-apkweb-')) { const original = lower.slice('x-apkweb-'.length); if (original !== 'accept-encoding' && !HOP_BY_HOP.has(original)) for (const v of values) headers.append(original, v); continue; }
+    if (HOP_BY_HOP.has(lower) || FROM_BROWSER.has(lower) || lower.startsWith('sec-') || lower.startsWith('access-control-')) continue;
+    for (const v of values) headers.append(name, v);
+  }
+  return headers;
+}
+/** The target's response headers as the page gets them through the per-request path: hop-by-hop and the target's CORS headers left out, Set-Cookie as x-apkweb-set-cookie (JSON). */
+function pageHeaders(response) {
+  const out = [];
+  for (const [name, value] of Object.entries(response.headers)) { const lower = name.toLowerCase(); if (RESPONSE_DROP.has(lower) || lower.startsWith('access-control-')) continue; for (const v of Array.isArray(value) ? value : [value]) out.push([name, String(v)]); }
+  const cookies = response.headers['set-cookie'] ?? [];
+  if (cookies.length) out.push(['x-apkweb-set-cookie', JSON.stringify(cookies)]);
+  return out;
+}
+/**
+ * One exchange of the channel, decided exactly as the per-request path decides it: `params` is the relay's query (url), `headers` the lab's headers.
+ * -> { local: { status, message } } (the relay's own answer: a bad url, a body over 32 MiB), { error: { code, message } } (the per-request path's 502 with x-apkweb-relay-error-code),
+ * or { response } (the target's http.IncomingMessage, redirects already followed).
+ */
+async function relayAnswer({ method, params, headers: entries, body, length = 0, timeoutMs, transport = {}, signal }) {
+  let parsed; try { parsed = new URL(params.get('url') ?? ''); } catch { return { local: { status: 400, message: 'missing or invalid url parameter' } }; }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return { local: { status: 400, message: `unsupported scheme ${parsed.protocol}` } };
+  if (length > MAX_BODY) return { local: { status: 413, message: 'request body over 32 MiB' } };
+  try { return { response: await send(parsed, method, upstreamHeaders(entries), method !== 'GET' && method !== 'HEAD' && body?.length ? body : undefined, timeoutMs, 0, { ...transport, signal }) }; }
+  catch (error) { return { error: { code: error?.code ?? 'EFETCH', message: String(error?.message ?? error).replace(/[\r\n]+/g, ' ').slice(0, 300) } }; }
 }
 
 // ---- TCP tunnel (/<token>/tcp): a TCP stream for a socket of the lab whose conversation is not HTTP/1.1 (HTTP/2 with prior knowledge, as gRPC clients speak; MQTT; a database
@@ -220,6 +268,128 @@ async function tunnel({ req, socket, token, allowed, timeoutMs, note = () => {} 
 }
 
 
+
+// ---- The parallel channel (/<token>/mux) -------------------------------------------------------------------------------------------------------------------------------------
+// One WebSocket from the lab carries many exchanges at once, multiplexed by id; each runs here concurrently, through Node's HTTP client (keep-alive agents), decided by relayAnswer.
+// Text messages are JSON control messages, binary messages body bytes: [kind u8][id u32 big-endian][bytes] (kind 1: request body, lab -> relay; kind 2: response body, relay -> lab).
+//   relay -> lab  {"t":"hello","v":1,"window":262144,"maxBody":33554432,"frame":65536}       the first message: this relay has the channel (an older relay refuses the upgrade)
+//   lab -> relay  {"t":"req","id":n,"method","query":"?url=...","headers":[[name,value]...],"length":bytes}   then `length` request body bytes in kind-1 frames (none above maxBody)
+//   relay -> lab  {"t":"head","id":n,"status","statusText","headers":[[name,value]...]}       the headers the per-request path gives the page (x-apkweb-set-cookie included)
+//   relay -> lab  kind-2 frames, never more than the credit the lab granted: `window` bytes at first, plus every {"t":"credit","id":n,"n":bytes} the lab sends as its reader consumes
+//   relay -> lab  {"t":"end","id":n}  |  {"t":"error","id":n,"code","message"}   (before the head: the per-request path's 502 relay error; after it: the body failed)
+//   lab -> relay  {"t":"abort","id":n}   the app closed the exchange: the upstream request is destroyed
+// A Content-Encoding the browser would have decoded on the per-request path (gzip, deflate, br, zstd) is decoded here, nothing else: the lab gets the bytes the page would have got.
+// Nothing is compressed, cached or kept. Backpressure: a full socket (write() false) holds every exchange's body until 'drain'; an exchange out of credit pauses its upstream.
+const MUX_VERSION = 1;
+const MUX_WINDOW = 256 * 1024, MUX_FRAME = 64 * 1024, KIND_REQUEST_BODY = 1, KIND_RESPONSE_BODY = 2;
+const NULL_BODY = new Set([101, 103, 204, 205, 304]);   // statuses fetch gives no body for
+/** A binary WebSocket frame (unmasked, server -> client) holding [kind][id][bytes], written in one buffer. */
+function muxFrame(kind, id, bytes) {
+  const n = 5 + bytes.length, head = n < 126 ? 2 : n < 65536 ? 4 : 10, out = Buffer.allocUnsafe(head + n);
+  out[0] = 0x82; if (n < 126) out[1] = n; else if (n < 65536) { out[1] = 126; out.writeUInt16BE(n, 2); } else { out[1] = 127; out.writeUInt32BE(Math.floor(n / 0x100000000), 2); out.writeUInt32BE(n >>> 0, 6); }
+  out[head] = kind; out.writeUInt32BE(id >>> 0, head + 1); bytes.copy(out, head + 5); return out;
+}
+/** The body as the page would have read it: a Content-Encoding the browser decodes (gzip, x-gzip, deflate zlib or raw, br, zstd) undone; any other (or several) left as it came. */
+async function decodedBody(response) {
+  const coding = String(response.headers['content-encoding'] ?? '').trim().toLowerCase();
+  if (coding === 'gzip' || coding === 'x-gzip') return response.pipe(zlib.createGunzip({ finishFlush: zlib.constants.Z_SYNC_FLUSH }));
+  if (coding === 'br') return response.pipe(zlib.createBrotliDecompress());
+  if (coding === 'zstd' && typeof zlib.createZstdDecompress === 'function') return response.pipe(zlib.createZstdDecompress());
+  if (coding !== 'deflate') return response;
+  // "deflate" is zlib-wrapped by the standard, raw by some servers; a browser takes both. The first bytes say which.
+  const first = await new Promise(resolve => { const done = value => { response.off('data', onData); response.off('end', onEnd); response.off('error', onEnd); response.pause(); resolve(value); }, onData = chunk => done(chunk), onEnd = () => done(null); response.on('data', onData); response.once('end', onEnd); response.once('error', onEnd); });
+  if (!first) return Readable.from([]);
+  const wrapped = first.length >= 2 && (first[0] & 0x0f) === 8 && ((first[0] << 8) | first[1]) % 31 === 0;
+  const decoder = wrapped ? zlib.createInflate({ finishFlush: zlib.constants.Z_SYNC_FLUSH }) : zlib.createInflateRaw({ finishFlush: zlib.constants.Z_SYNC_FLUSH });
+  decoder.write(first);
+  if (response.readableEnded) decoder.end(); else response.pipe(decoder);   // a body of one chunk has ended already
+  return decoder;
+}
+/** The channel's upgrade: the same origin and token rules as the per-request path (the path names the token). `answer(exchange)` decides an exchange (relayAnswer). */
+function muxChannel({ req, socket, allowed, answer, sessions, onExchange = () => {} }) {
+  const origin = req.headers.origin ?? '';
+  const refuse = (status, text, message) => { socket.end(`HTTP/1.1 ${status} ${text}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n${message}`); };
+  if (!allowed.has(origin)) return refuse(403, 'Forbidden', `origin not allowed: ${origin || '(none)'}`);
+  const key = req.headers['sec-websocket-key']; if (!key || String(req.headers.upgrade ?? '').toLowerCase() !== 'websocket') return refuse(400, 'Bad Request', 'a WebSocket upgrade is expected');
+  socket.write(['HTTP/1.1 101 Switching Protocols', 'Upgrade: websocket', 'Connection: Upgrade', `Sec-WebSocket-Accept: ${createHash('sha1').update(key + WS_GUID).digest('base64')}`, '', ''].join('\r\n'));
+  socket.setNoDelay?.(true); sessions?.add(socket);
+  const exchanges = new Map(); let blocked = false, closed = false;
+  const write = frame => { if (closed || socket.destroyed) return false; if (!socket.write(frame)) blocked = true; return true; };
+  const say = value => write(wsFrame(0x1, Buffer.from(JSON.stringify(value))));
+  const protocolError = text => { say({ t: 'error', id: 0, code: 'EPROTO', message: text }); closed = true; socket.end(wsFrame(0x8, Buffer.from([1002 >> 8, 1002 & 255]))); };
+  const forget = exchange => { exchanges.delete(exchange.id); exchange.done = true; };
+  const finish = exchange => { if (exchange.done) return; forget(exchange); say({ t: 'end', id: exchange.id }); onExchange(exchange, null); };
+  const failed = (exchange, code, message) => { if (exchange.done) return; forget(exchange); say({ t: 'error', id: exchange.id, code, message: String(message).replace(/[\r\n]+/g, ' ').slice(0, 300) }); onExchange(exchange, code); };
+  // sends what the exchange's credit and the socket allow; the upstream is paused while bytes wait, resumed once they left
+  const pump = exchange => {
+    while (exchange.pending.length && exchange.credit > 0 && !blocked && !exchange.done) {
+      const chunk = exchange.pending[0], n = Math.min(chunk.length, exchange.credit, MUX_FRAME);
+      write(muxFrame(KIND_RESPONSE_BODY, exchange.id, n === chunk.length ? chunk : chunk.subarray(0, n)));
+      exchange.credit -= n; exchange.waiting -= n; if (n === chunk.length) exchange.pending.shift(); else exchange.pending[0] = chunk.subarray(n);
+    }
+    if (exchange.source && !exchange.done) { if (exchange.waiting > 0) exchange.source.pause(); else exchange.source.resume(); }
+    if (exchange.ended && !exchange.pending.length) finish(exchange);
+  };
+  const start = async exchange => {
+    const controller = new AbortController(); exchange.controller = controller;
+    const body = exchange.chunks.length ? Buffer.concat(exchange.chunks) : null; exchange.chunks = [];
+    const result = await answer({ method: exchange.method, params: exchange.params, headers: exchange.headers, body, length: exchange.length, signal: controller.signal });
+    if (exchange.done || closed) { result.response?.destroy(); return; }   // aborted (or the channel closed) while the target was being asked
+    if (result.error) return failed(exchange, result.error.code, result.error.message);
+    if (result.local) {
+      const text = Buffer.from(result.local.message);
+      say({ t: 'head', id: exchange.id, status: result.local.status, statusText: http.STATUS_CODES[result.local.status] ?? '', headers: [['content-type', 'text/plain; charset=utf-8'], ['content-length', String(text.length)]] });
+      exchange.pending.push(text); exchange.waiting += text.length; exchange.ended = true; return pump(exchange);
+    }
+    const response = result.response; exchange.status = response.statusCode;
+    say({ t: 'head', id: exchange.id, status: response.statusCode, statusText: response.statusMessage || http.STATUS_CODES[response.statusCode] || '', headers: pageHeaders(response) });
+    if (exchange.method === 'HEAD' || NULL_BODY.has(response.statusCode)) { response.resume(); return finish(exchange); }
+    let source; try { source = await decodedBody(response); } catch (error) { response.destroy(); return failed(exchange, error?.code ?? 'EFETCH', error?.message ?? error); }
+    if (exchange.done || closed) { response.destroy(); return; }
+    exchange.source = source; exchange.response = response;
+    source.on('data', chunk => { exchange.pending.push(chunk); exchange.waiting += chunk.length; pump(exchange); });
+    source.on('end', () => { exchange.ended = true; pump(exchange); });
+    const broken = error => { if (!exchange.done) { response.destroy(); failed(exchange, error?.code ?? 'ECONNRESET', error?.message ?? 'the target closed the connection'); } };
+    source.on('error', broken); if (source !== response) response.on('error', broken);
+    response.on('close', () => { if (!response.complete) broken(Object.assign(new Error('the target closed the connection before the end of the body'), { code: 'ECONNRESET' })); });
+  };
+  const onText = text => {
+    let message; try { message = JSON.parse(text); } catch { return protocolError('a control message that is not JSON'); }
+    const id = message?.id;
+    if (message?.t === 'req') {
+      if (!Number.isInteger(id) || id < 1 || id > 0xffffffff || exchanges.has(id)) return protocolError(`req: bad or duplicate id ${id}`);
+      const length = Number(message.length) || 0, method = String(message.method ?? 'GET').toUpperCase();
+      const exchange = { id, method, params: new URLSearchParams(String(message.query ?? '')), headers: Array.isArray(message.headers) ? message.headers.filter(pair => Array.isArray(pair) && pair.length === 2).map(([n, v]) => [String(n), String(v)]) : [],
+        length, chunks: [], received: 0, credit: MUX_WINDOW, pending: [], waiting: 0, ended: false, done: false, source: null, response: null, controller: null, status: null, started: Date.now() };
+      exchanges.set(id, exchange);
+      if (length <= 0 || length > MAX_BODY) start(exchange);   // over the limit: the lab sends no body, the answer is the per-request path's 413
+      return;
+    }
+    const exchange = exchanges.get(id); if (!exchange) return;   // an exchange that already ended (an abort or a credit crossing its end)
+    if (message.t === 'credit') { exchange.credit += Math.max(0, Number(message.n) || 0); pump(exchange); }
+    else if (message.t === 'abort') { forget(exchange); exchange.controller?.abort(); exchange.response?.destroy(); exchange.source?.destroy?.(); onExchange(exchange, 'aborted'); }
+  };
+  const onBinary = payload => {
+    if (payload.length < 5 || payload[0] !== KIND_REQUEST_BODY) return protocolError('a binary message that is not a request body');
+    const exchange = exchanges.get(payload.readUInt32BE(1)); if (!exchange || exchange.controller) return;   // aborted, or more bytes than announced (ignored once started)
+    const bytes = payload.subarray(5); exchange.chunks.push(bytes); exchange.received += bytes.length;
+    if (exchange.received >= exchange.length) start(exchange);
+  };
+  const decode = wsDecoder();
+  socket.on('data', chunk => {
+    for (const { opcode, payload } of decode(chunk)) {
+      if (closed) return;
+      if (opcode === 0x1) onText(payload.toString('utf8'));
+      else if (opcode === 0x2) onBinary(payload);
+      else if (opcode === 0x9) write(wsFrame(0xA, payload));
+      else if (opcode === 0x8) { closed = true; if (!socket.destroyed) socket.end(wsFrame(0x8, Buffer.from([1000 >> 8, 1000 & 255]))); }
+    }
+  });
+  socket.on('drain', () => { blocked = false; for (const exchange of [...exchanges.values()]) { pump(exchange); if (blocked) break; } });
+  socket.on('error', () => {});
+  socket.on('close', () => { closed = true; sessions?.delete(socket); for (const exchange of exchanges.values()) { exchange.done = true; exchange.controller?.abort(); exchange.response?.destroy(); } exchanges.clear(); });
+  say({ t: 'hello', v: MUX_VERSION, window: MUX_WINDOW, maxBody: MAX_BODY, frame: MUX_FRAME });
+}
 
 // ---- the desktop app: settings kept between runs, the command line, the browser opened on the status page ----------------------------------------------------------------
 function configDir(env = process.env, platform = process.platform, home = os.homedir()) {
@@ -303,6 +473,6 @@ async function main(argv = process.argv.slice(2)) {
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
 }
 
-module.exports = { VERSION, DEFAULT_PORT, DEFAULT_ORIGINS, createRelay, configDir, loadSettings, saveSettings, parseArguments, resolveSettings, main };
+module.exports = { VERSION, MUX_VERSION, DEFAULT_PORT, DEFAULT_ORIGINS, createRelay, configDir, loadSettings, saveSettings, parseArguments, resolveSettings, main };
 const isSea = (() => { try { return require('node:sea').isSea(); } catch { return false; } })();   // the single executable built by scripts/build-sea.mjs
 if (isSea || require.main === module) main();

@@ -127,3 +127,64 @@ test('the TCP tunnel: a WebSocket on /<token>/tcp connects to the target and cop
   assert.equal(await new Promise(resolve => { stranger.onopen = () => resolve('open'); stranger.onerror = () => resolve('refused'); }), 'refused');
   local.socket.close(); target.close(); for (const s of [server, plain.server]) s.closeAllConnections?.();
 });
+
+// ---- the parallel channel (/<token>/mux, since 0.4.0): the protocol the lab's src/relay-mux.js speaks ------------------------------------------------------------------------
+/** A channel client as the lab's: JSON control messages, binary frames [kind][id u32][bytes]; collects every exchange's head, body, end and error, and grants credit only when told. */
+function channelClient(port, { origin = ORIGIN, token = TOKEN, autoCredit = true } = {}) {
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/${token}/mux`, { headers: { origin } }), exchanges = new Map(); let hello = null, nextId = 1, failed = false;
+  socket.binaryType = 'arraybuffer';
+  const of = id => { if (!exchanges.has(id)) exchanges.set(id, { head: null, chunks: [], bytes: 0, end: false, error: null }); return exchanges.get(id); };
+  socket.onmessage = event => {
+    if (typeof event.data === 'string') { const message = JSON.parse(event.data); if (message.t === 'hello') { hello = message; return; } const exchange = of(message.id); if (message.t === 'head') exchange.head = message; else if (message.t === 'end') exchange.end = true; else if (message.t === 'error') exchange.error = message; return; }
+    const bytes = Buffer.from(event.data), exchange = of(bytes.readUInt32BE(1)), body = bytes.subarray(5); exchange.chunks.push(body); exchange.bytes += body.length;
+    if (autoCredit) socket.send(JSON.stringify({ t: 'credit', id: bytes.readUInt32BE(1), n: body.length }));
+  };
+  socket.onerror = () => { failed = true; };
+  const until = async (check, what, ms = 3000) => { for (let i = 0; i < ms / 10; i++) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 10)); } assert.fail(`${what}: ${JSON.stringify([...exchanges.values()].map(e => ({ ...e, chunks: e.chunks.length })))}`); };
+  const request = (url, { method = 'GET', headers = [], body = null } = {}) => {
+    const id = nextId++; of(id);
+    socket.send(JSON.stringify({ t: 'req', id, method, query: `?url=${encodeURIComponent(url)}`, headers, length: body ? body.length : 0 }));
+    if (body) { const frame = Buffer.alloc(5 + body.length); frame[0] = 1; frame.writeUInt32BE(id, 1); Buffer.from(body).copy(frame, 5); socket.send(frame); }
+    return id;
+  };
+  return { socket, exchanges, request, until, hello: () => hello, failed: () => failed, text: id => Buffer.concat(exchanges.get(id).chunks).toString(), header: (id, name) => exchanges.get(id).head.headers.filter(([n]) => n.toLowerCase() === name).map(([, v]) => v) };
+}
+
+test('the channel: a hello first, then exchanges decided as the per-request path decides them (headers restored, Set-Cookie, redirects without credentials to another host, gzip decoded)', async () => {
+  const { port } = await relay(), client = channelClient(port);
+  await client.until(() => client.hello(), 'hello'); assert.deepEqual([client.hello().v, client.hello().window, client.hello().maxBody], [1, 262144, 32 * 1024 * 1024]);
+  const get = client.request(target('/hello?x=1'), { headers: [['x-apkweb-user-agent', 'Dalvik/2.1.0 (Linux; U; Android 13)'], ['x-apkweb-cookie', 'a=1'], ['X-App', 'yes']] });
+  const post = client.request(target('/echo'), { method: 'POST', headers: [['content-type', 'application/json']], body: Buffer.from('{"a":1}') });
+  const away = client.request(target('/away'), { headers: [['x-apkweb-cookie', 'secret=1'], ['authorization', 'Bearer t']] });
+  const zipped = client.request(target('/gzip'));
+  await client.until(() => [get, post, away, zipped].every(id => client.exchanges.get(id).end), 'four exchanges');
+  const seen = JSON.parse(client.text(get));
+  assert.equal(client.exchanges.get(get).head.status, 200); assert.equal(seen.url, '/hello?x=1'); assert.equal(seen.headers['user-agent'], 'Dalvik/2.1.0 (Linux; U; Android 13)'); assert.equal(seen.headers.cookie, 'a=1'); assert.equal(seen.headers['x-app'], 'yes'); assert.equal(seen.headers.origin, undefined);
+  assert.deepEqual(JSON.parse(client.header(get, 'x-apkweb-set-cookie')[0]), ['session=abc; Path=/', 'theme=dark; HttpOnly']); assert.deepEqual(client.header(get, 'access-control-allow-origin'), [], 'the target\'s CORS headers never pass');
+  assert.deepEqual([JSON.parse(client.text(post)).method, JSON.parse(client.text(post)).body], ['POST', '{"a":1}']);
+  const moved = JSON.parse(client.text(away)); assert.equal(moved.url, '/final'); assert.equal(moved.headers.cookie, undefined); assert.equal(moved.headers.authorization, undefined);
+  assert.equal(client.text(zipped), 'compressed body', 'decoded as the browser would have decoded it'); assert.deepEqual(client.header(zipped, 'content-encoding'), ['gzip'], 'the header says what the server sent (the lab drops it, as for a body the browser decoded)');
+  client.socket.close();
+});
+
+test('the channel runs exchanges at once, holds each to its credit, aborts on request and reports unreachable targets by code; other pages and tokens are refused', async () => {
+  const slow = http.createServer((req, res) => { const url = new URL(req.url, 'http://x'); if (url.pathname === '/big') { res.writeHead(200, { 'content-length': String(4 * 1024 * 1024) }); const block = Buffer.alloc(64 * 1024, 1); let sent = 0; const pump = () => { while (sent < 4 * 1024 * 1024) { sent += block.length; if (!res.write(block)) return res.once('drain', pump); } res.end(); }; slow.big = () => sent; return pump(); } if (url.pathname === '/hang') { slow.hung = req; req.on('close', () => { slow.closed = true; }); return; } setTimeout(() => res.end(`late ${url.search}`), 150); });
+  const slowPort = await listen(slow), { port, server } = await relay(), client = channelClient(port);
+  await client.until(() => client.hello(), 'hello');
+  const begin = Date.now(), ids = Array.from({ length: 30 }, (_, i) => client.request(`http://127.0.0.1:${slowPort}/d?i=${i}`));
+  await client.until(() => ids.every(id => client.exchanges.get(id).end), 'thirty exchanges');
+  assert.ok(Date.now() - begin < 1000, `30 exchanges of 150 ms took ${Date.now() - begin} ms`); assert.equal(client.text(ids[29]), 'late ?i=29'); assert.equal(server.channelCount(), 1);
+  const held = channelClient(port, { autoCredit: false }); await held.until(() => held.hello(), 'hello');
+  const big = held.request(`http://127.0.0.1:${slowPort}/big`); await held.until(() => held.exchanges.get(big).bytes >= 262144, 'one window');
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(held.exchanges.get(big).bytes, 262144, 'never more than the credit'); assert.ok(slow.big() < 3 * 1024 * 1024, `the target was held back (${slow.big()} bytes sent)`);
+  held.socket.send(JSON.stringify({ t: 'credit', id: big, n: 4 * 1024 * 1024 })); await held.until(() => held.exchanges.get(big).end, 'the rest after credit'); assert.equal(held.exchanges.get(big).bytes, 4 * 1024 * 1024);
+  const hang = client.request(`http://127.0.0.1:${slowPort}/hang`); await client.until(() => slow.hung, 'the target asked');
+  client.socket.send(JSON.stringify({ t: 'abort', id: hang })); await client.until(() => slow.closed, 'the upstream request destroyed');
+  const closed = http.createServer(), closedPort = await listen(closed); closed.close();
+  const refused = client.request(`http://127.0.0.1:${closedPort}/`); await client.until(() => client.exchanges.get(refused).error, 'the error'); assert.equal(client.exchanges.get(refused).error.code, 'ECONNREFUSED');
+  const status = await (await fetch(`http://127.0.0.1:${port}/status.json`)).json(); assert.equal(status.channels, 2); assert.ok(status.recent.some(item => item.via === 'channel' && item.status === 200));
+  const stranger = channelClient(port, { origin: 'https://evil.example' }), wrong = channelClient(port, { token: 'another-token' });
+  await stranger.until(() => stranger.failed(), 'another page refused'); await wrong.until(() => wrong.failed(), 'another token refused');
+  client.socket.close(); held.socket.close(); slow.closeAllConnections?.(); slow.close();
+});
