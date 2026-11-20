@@ -60,6 +60,7 @@ Settings live in `%APPDATA%\apk-lab-relay` (Windows), `~/Library/Application Sup
 - Every request must carry the token in its path and come from one of the allowed pages, so another site open in the same browser cannot use the relay.
 - Destinations are not restricted: whatever the lab asks for, the relay fetches from your computer, including servers on this computer and on your local network.
 - The status page answers only to `127.0.0.1` and `localhost`, which protects against *DNS rebinding*.
+- WebView documents (since 0.5.0) are served on `http://<label>.localhost:<port>` addresses whose 20-hex-digit label is the capability: it exists only while the lab page that opened it is connected.
 - Nothing is stored besides the settings. Requests and responses pass through and are forgotten, and the status page's history (the last 50, without query strings) lives only in memory.
 
 ## How it works
@@ -95,6 +96,19 @@ The protocol, version 1. Text messages are JSON; binary messages carry body byte
 | lab → relay | `{"t":"abort","id":1}` | the app closed the request: the relay cancels it at the destination |
 
 The status page shows how many channels are open and marks the requests that came over one.
+
+## WebView documents (since 0.5.0)
+
+An Android app's `WebView` shows any page; a browser page can only frame a page that allows it, and can never read or script a page of another origin. With the relay as the Proxy, the lab shows a WebView's web pages from the relay instead: the frame's address is `http://<label>.localhost:<port>/<path>`, where `<label>` (20 random hex digits) stands for one origin of one WebView of one lab page. The relay fetches the real page from this computer and serves it to the frame:
+
+- the page's framing headers (`X-Frame-Options`, CSP `frame-ancestors`) and its own CSP are not passed on; the lab's CSP replaces them, so the page reaches the network only through the relay;
+- every request of the page (images, scripts, XHR, navigations, redirects) comes to the relay first, and the relay asks the lab over its channel before anything leaves this computer. The lab answers from the virtual device: its allowed hosts and redirect rules, the app's own cookies (sent as `Cookie`; `Set-Cookie` goes back to the app's cookie store and never to the browser), the app's user agent, or the app's own answer;
+- redirects are answered to the frame with the slot address of their target, so the lab decides each hop and stores its cookies first; absolute addresses of other origins in HTML and CSS are rewritten to their slots;
+- the page's synchronous calls into the app (a JavaScript interface method and its return value, `document.cookie`, a navigation the app may take over) are POSTs to `/__apkweb/*` on its own slot, answered when the app answered.
+
+The channel is a WebSocket from the lab to `ws://127.0.0.1:<port>/<token>/webview` (same token and allowed-page rules as everything else). Its protocol (version 1) is described at the top of `src/webview.cjs`, which is the same file as the lab's `scripts/relay-webview.cjs`. A relay older than 0.5.0 refuses the channel, and the lab then frames pages directly, as before.
+
+Security of this part: a slot address is a capability (80 random bits) of one lab page's channel and disappears with it; requests to a slot carry none of the browser's cookies and receive none; nothing is stored. Only the lab page that opened a document answers its requests, and the lab keeps each app's cookies separately.
 
 ## Develop
 

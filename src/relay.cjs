@@ -11,6 +11,7 @@
 //    `x-apkweb-relay-error`, which the lab turns into the exception an Android device would throw (UnknownHostException, ConnectException, SSLHandshakeException ...).
 //  - the parallel channel (since 0.4.0; /<token>/mux, a WebSocket; the lab's Device > "Parallel relay channel"): many exchanges at once over one connection, multiplexed by id,
 //    each decided by the same code as the per-request path, with a credit window per exchange (protocol at muxChannel below and in README.md).
+//  - WebView documents (since 0.5.0; src/webview.cjs): the lab's WebViews show web pages served here on http://<label>.localhost:<port>, every request decided by the lab.
 //
 // Safety: it listens on 127.0.0.1 only; every relayed request must carry the random token in its path and come from one of the allowed page origins, so another site open in the
 // same browser cannot use it. Targets on this computer or the local network are refused unless "allow private" is on. Nothing is stored but the settings (token, port, origins):
@@ -29,8 +30,9 @@ const zlib = require('node:zlib');
 const { Readable } = require('node:stream');
 const { isIP } = net;
 const { spawn } = require('node:child_process');
+const { createWebViewRelay } = require('./webview.cjs');
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 const DEFAULT_PORT = 8787;
 const DEFAULT_ORIGINS = ['https://madmax-dev-br.github.io', 'http://127.0.0.1:8765', 'http://localhost:8765'];
 const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'host', 'content-length', 'expect']);
@@ -48,7 +50,7 @@ function send(url, method, headers, body, timeoutMs, hops = 0, transport = {}) {
     const agent = transport.agents?.[url.protocol];   // keep-alive connections per destination
     const request = (url.protocol === 'https:' ? https : http).request(url, { method, headers: outgoing, timeout: timeoutMs, ...(agent ? { agent } : {}), ...(transport.signal ? { signal: transport.signal } : {}) }, response => {
       const status = response.statusCode, location = response.headers.location;
-      if ([301, 302, 303, 307, 308].includes(status) && location) {
+      if (!transport.manualRedirects && [301, 302, 303, 307, 308].includes(status) && location) {
         response.resume();
         if (hops >= 20) return reject(Object.assign(new Error('Too many follow-up requests: 21'), { code: 'EREDIRECT' }));
         const next = new URL(location, url), asGet = status === 303 || ((status === 301 || status === 302) && method === 'POST');
@@ -112,6 +114,7 @@ function createRelay({ token, origins = DEFAULT_ORIGINS, timeoutMs = 60000, port
   const cors = (origin, res, extra = {}) => { res.setHeader('Access-Control-Allow-Origin', origin); res.setHeader('Vary', 'Origin'); for (const [name, value] of Object.entries(extra)) res.setHeader(name, value); };
   const fail = (res, status, message) => { res.statusCode = status; res.setHeader('Content-Type', 'text/plain; charset=utf-8'); res.end(message); };
   const server = http.createServer(async (req, res) => {
+    if (webview.owns(req)) return webview.serve(req, res);   // a WebView document (http://<label>.localhost:<port>/...): src/webview.cjs
     const origin = req.headers.origin ?? '';
     const url = new URL(req.url, 'http://relay.invalid');
     // the status page and its data: only to this computer's own names (a site that rebinds its domain to 127.0.0.1 gets nothing)
@@ -156,15 +159,20 @@ function createRelay({ token, origins = DEFAULT_ORIGINS, timeoutMs = 60000, port
     response.on('error', () => res.destroy()).pipe(res);
   });
   server.recent = recent;
+  // WebView documents (since 0.5.0): src/webview.cjs. One hop per request (the frame follows redirects itself, so the lab decides each one).
+  const webview = createWebViewRelay({ token, allowed, timeoutMs, note, port: () => server.address()?.port ?? port,
+    upstream: (target, method, headers, body, { signal, timeoutMs: ms }) => send(target, method, headers, body, ms ?? timeoutMs, 0, { ...transport, signal, manualRedirects: true }) });
   server.on('upgrade', (req, socket) => {
     const pathname = new URL(req.url, 'http://relay.invalid').pathname;
+    if (pathname === `/${token}/webview`) return webview.channel(req, socket);
     if (pathname === `/${token}/mux`) return muxChannel({ req, socket, allowed, sessions, answer: exchange => relayAnswer({ ...exchange, timeoutMs, transport }),
       onExchange: (exchange, outcome) => { let shown = ''; try { const parsed = new URL(exchange.params.get('url') ?? ''); shown = `${parsed.protocol}//${parsed.host}${parsed.pathname}`; } catch { shown = '(invalid url)'; } note({ method: exchange.method, url: shown, status: exchange.status ?? 502, ...(outcome && outcome !== 'aborted' ? { error: outcome } : {}), ...(outcome === 'aborted' ? { error: 'aborted' } : {}), ms: Date.now() - exchange.started, via: 'channel' }); } });
     return tunnel({ req, socket, token, allowed, timeoutMs, note });
   });
   const close = server.close.bind(server);   // an upgraded socket keeps the server open, so close() ends the channels and the kept-alive upstream connections first
-  server.close = callback => { for (const socket of sessions) socket.destroy(); for (const agent of Object.values(agents)) agent.destroy(); return close(callback); };
+  server.close = callback => { webview.close(); for (const socket of sessions) socket.destroy(); for (const agent of Object.values(agents)) agent.destroy(); return close(callback); };
   server.channelCount = () => sessions.size;
+  server.webviewChannelCount = () => webview.channelCount();
   server.closeChannels = () => { for (const socket of sessions) socket.destroy(); };
   return server;
 }
