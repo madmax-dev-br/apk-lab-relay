@@ -23,11 +23,11 @@ The executables are in [Releases](../../releases/latest):
 ## Use
 
 1. Open the program. On Windows, double-click the `.exe`. On macOS and Linux, extract the `.tar.gz` and run `./apk-lab-relay`.
-2. It opens a status page in the browser (`http://127.0.0.1:8787/`) with the proxy address. Copy the address.
-3. In the lab, go to **Controls › Device › Proxy** and paste the address.
+2. It opens a status page in the browser (`http://127.0.0.1:8787/`) that lists what goes through it.
+3. Open the lab (or reload it). It finds the relay by itself: leave **Controls › Network › Proxy and relay** empty, and it says "Relay found at 127.0.0.1:8787 (automatic)". Chrome may ask once to let the page reach this computer.
 4. Keep the program open while you use the lab. Closing the window (or Ctrl+C) stops it.
 
-The address has a random token. It is saved, so the address stays the same next time and you do not have to paste it again.
+Since 0.6.0 there is no token and nothing to copy. An address saved from an older version (`http://127.0.0.1:8787/<token>/?url={url}`) keeps working. On another port (`--port`), paste the address the program prints.
 
 ### System warnings the first time
 
@@ -42,22 +42,22 @@ The executables are not signed.
 apk-lab-relay [options]
   --port <n>           port on 127.0.0.1 (default 8787; saved)
   --origin <url>       a page that may use the relay (repeat for several; saved)
-  --token <text>       use this token in the address (saved)
-  --new-token          make a new token (the Proxy address changes)
+  --ca <file.pem>      also trust the certificates of this file (a server with an internal CA)
   --no-open            do not open the status page in the browser
   --version, --help
 ```
 
 By default the published lab (`https://madmax-dev-br.github.io`) and a local copy (`http://127.0.0.1:8765`, `http://localhost:8765`) may use the relay. To use it with the lab served from another address, pass `--origin http://localhost:5173`.
 
-The relay reaches any destination: the internet, this computer and the local network. There is no option for that. `--allow-private`, from older versions, is still accepted and does nothing.
+The relay reaches any destination: the internet, this computer and the local network. There is no option for that. `--allow-private`, `--token` and `--new-token`, from older versions, are still accepted and do nothing.
 
 Settings live in `%APPDATA%\apk-lab-relay` (Windows), `~/Library/Application Support/apk-lab-relay` (macOS) or `~/.config/apk-lab-relay` (Linux).
 
 ## Security
 
 - The relay listens only on `127.0.0.1`: another computer on the network cannot reach it.
-- Every request must carry the token in its path and come from one of the allowed pages, so another site open in the same browser cannot use the relay.
+- Every request, WebSockets included, must come from one of the allowed pages (its `Origin`, which a page cannot change), so another site open in the same browser cannot use the relay. There is no token: a program on this computer can use the relay, as it could reach the network by itself.
+- A client certificate the lab hands over (mutual TLS) is kept in memory only, for the destination it was chosen for.
 - Destinations are not restricted: whatever the lab asks for, the relay fetches from your computer, including servers on this computer and on your local network.
 - The status page answers only to `127.0.0.1` and `localhost`, which protects against *DNS rebinding*.
 - WebView documents (since 0.5.0) are served on `http://<label>.localhost:<port>` addresses whose 20-hex-digit label is the capability: it exists only while the lab page that opened it is connected.
@@ -65,8 +65,9 @@ Settings live in `%APPDATA%\apk-lab-relay` (Windows), `~/Library/Application Sup
 
 ## How it works
 
-It is the same protocol as the lab's `cors-relay.mjs` (version 0.4.0):
+It is the same protocol as the lab's `cors-relay.mjs` (version 0.5.0), which this program runs unchanged:
 
+- `GET /hello` tells an allowed page that this is the relay, its version and what it has.
 - The destination goes in the `url` parameter.
 - Headers the browser will not send (Cookie, User-Agent, Origin, Referer...) arrive as `x-apkweb-<name>` and leave under their original name.
 - Redirects are followed here. Credentials do not follow to another host.
@@ -75,13 +76,13 @@ It is the same protocol as the lab's `cors-relay.mjs` (version 0.4.0):
 
 ## TCP tunnel (gRPC, HTTP/2, other protocols)
 
-Since 0.2.0 the relay also opens TCP connections for the lab. When an app speaks something other than HTTP/1.1 on a socket (Cloud Firestore's gRPC uses HTTP/2; MQTT; database protocols), the lab sends that connection through the relay: the page opens a WebSocket at `ws://127.0.0.1:8787/<token>/tcp?host=…&port=…`, and the relay connects to the destination from your computer and passes the bytes both ways. The same rules apply as for the rest: only the allowed pages, only with the token. Any destination is reachable, including emulators running on your computer (for example the Firebase emulators).
+Since 0.2.0 the relay also opens TCP connections for the lab. When an app speaks something other than HTTP/1.1 on a socket (Cloud Firestore's gRPC uses HTTP/2; MQTT; database protocols), the lab sends that connection through the relay: the page opens a WebSocket at `ws://127.0.0.1:8787/tcp?host=…&port=…`, and the relay connects to the destination from your computer and passes the bytes both ways. The same rules apply as for the rest: only the allowed pages. Any destination is reachable, including emulators running on your computer (for example the Firebase emulators).
 
 ## Parallel channel (since 0.4.0)
 
-Without it, every request the app makes is a separate browser request to the relay. The browser opens at most about 6 connections to one address, so an app that fires 20 or 50 requests at once gets them answered 6 at a time, and most requests also cost a CORS preflight first. With the lab's **Controls › Device › Parallel relay channel** switch on (off by default), the lab opens one WebSocket to `ws://127.0.0.1:8787/<token>/mux` and sends every request over it at once; the relay runs them concurrently from your computer, keeping connections to each server alive. Measured in Chrome with a server that answers after 100 ms: 20 requests at once took 410 ms as separate requests and 104 ms over the channel; 50 took 925 ms and 106 ms. Through the whole lab, an app firing 20 requests at once on a thread pool got its answers in 421 ms without the channel and 118 ms with it; 50 requests, 937 ms and 123 ms.
+Without it, every request the app makes is a separate browser request to the relay. The browser opens at most about 6 connections to one address, so an app that fires 20 or 50 requests at once gets them answered 6 at a time, and most requests also cost a CORS preflight first. With the lab's **Controls › Network › Parallel relay channel** switch on (on by default), the lab opens one WebSocket to `ws://127.0.0.1:8787/mux` and sends every request over it at once; the relay runs them concurrently from your computer, keeping connections to each server alive. Measured in Chrome with a server that answers after 100 ms: 20 requests at once took 410 ms as separate requests and 104 ms over the channel; 50 took 925 ms and 106 ms. Through the whole lab, an app firing 20 requests at once on a thread pool got its answers in 421 ms without the channel and 118 ms with it; 50 requests, 937 ms and 123 ms.
 
-Nothing else changes: each request through the channel is decided by the same code as a separate request (the headers, redirects, `Set-Cookie`, the error codes, the timeouts), and the lab gets the same status, headers and bytes. A relay older than 0.4.0 refuses the channel, and the lab then sends separate requests as before. The same rules apply: only the allowed pages, only with the token.
+Nothing else changes: each request through the channel is decided by the same code as a separate request (the headers, redirects, `Set-Cookie`, the error codes, the timeouts), and the lab gets the same status, headers and bytes. A relay older than 0.4.0 refuses the channel, and the lab then sends separate requests as before. The same rules apply: only the allowed pages.
 
 The protocol, version 1. Text messages are JSON; binary messages carry body bytes as `[kind: 1 byte][exchange id: 4 bytes, big-endian][bytes]` (kind 1: request body, from the lab; kind 2: response body, from the relay).
 
@@ -106,7 +107,7 @@ An Android app's `WebView` shows any page; a browser page can only frame a page 
 - redirects are answered to the frame with the slot address of their target, so the lab decides each hop and stores its cookies first; absolute addresses of other origins in HTML and CSS are rewritten to their slots;
 - the page's synchronous calls into the app (a JavaScript interface method and its return value, `document.cookie`, a navigation the app may take over) are POSTs to `/__apkweb/*` on its own slot, answered when the app answered.
 
-The channel is a WebSocket from the lab to `ws://127.0.0.1:<port>/<token>/webview` (same token and allowed-page rules as everything else). Its protocol (version 1) is described at the top of `src/webview.cjs`, which is the same file as the lab's `scripts/relay-webview.cjs`. A relay older than 0.5.0 refuses the channel, and the lab then frames pages directly, as before.
+The channel is a WebSocket from the lab to `ws://127.0.0.1:<port>/webview` (same allowed-page rule as everything else). Its protocol (version 1) is described at the top of `src/webview.cjs`, which is the same file as the lab's `scripts/relay-webview.cjs`. A relay older than 0.5.0 refuses the channel, and the lab then frames pages directly, as before.
 
 Security of this part: a slot address is a capability (80 random bits) of one lab page's channel and disappears with it; requests to a slot carry none of the browser's cookies and receive none; nothing is stored. Only the lab page that opened a document answers its requests, and the lab keeps each app's cookies separately.
 

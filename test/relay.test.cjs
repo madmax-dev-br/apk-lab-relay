@@ -8,9 +8,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { gzipSync, gunzipSync } = require('node:zlib');
-const { createRelay, parseArguments, resolveSettings, configDir, loadSettings, saveSettings, DEFAULT_ORIGINS } = require('../src/relay.cjs');
+const { createRelay, relayRoute, proxyAddress, VERSION, parseArguments, resolveSettings, configDir, loadSettings, saveSettings, DEFAULT_ORIGINS } = require('../src/relay.cjs');
 
-const ORIGIN = 'https://lab.example.test', TOKEN = 'test-token-123';
+const ORIGIN = 'https://lab.example.test';
 const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 const upstream = http.createServer((req, res) => {
   const chunks = []; req.on('data', chunk => chunks.push(chunk)); req.on('end', () => {
@@ -26,9 +26,9 @@ const upstream = http.createServer((req, res) => {
 });
 let upstreamPort;
 const relays = [];
-async function relay(options = {}) { const server = createRelay({ token: TOKEN, origins: [ORIGIN], ...options }); relays.push(server); const port = await listen(server); return { server, port, base: `http://127.0.0.1:${port}` }; }
+async function relay(options = {}) { const server = createRelay({ origins: [ORIGIN], ...options }); relays.push(server); const port = await listen(server); return { server, port, base: `http://127.0.0.1:${port}` }; }
 const target = p => `http://127.0.0.1:${upstreamPort}${p}`;
-const via = (base, url, init = {}) => fetch(`${base}/${TOKEN}/?url=${encodeURIComponent(url)}`, { ...init, headers: { origin: ORIGIN, ...(init.headers ?? {}) } });
+const via = (base, url, init = {}) => fetch(`${base}/?url=${encodeURIComponent(url)}`, { ...init, headers: { origin: ORIGIN, ...(init.headers ?? {}) } });
 test.before(async () => { upstreamPort = await listen(upstream); });
 test.after(() => { upstream.close(); for (const server of relays) server.close(); });
 
@@ -56,21 +56,21 @@ test('a POST body passes through; redirects are followed (303 turns into GET) an
 
 test('a compressed body is passed as the server sent it, with its Content-Encoding', async () => {
   const { port } = await relay();
-  const raw = await new Promise((resolve, reject) => http.get({ host: '127.0.0.1', port, path: `/${TOKEN}/?url=${encodeURIComponent(target('/gzip'))}`, headers: { origin: ORIGIN } }, res => { const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => resolve({ headers: res.headers, body: Buffer.concat(chunks) })); }).on('error', reject));
+  const raw = await new Promise((resolve, reject) => http.get({ host: '127.0.0.1', port, path: `/?url=${encodeURIComponent(target('/gzip'))}`, headers: { origin: ORIGIN } }, res => { const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => resolve({ headers: res.headers, body: Buffer.concat(chunks) })); }).on('error', reject));
   assert.equal(raw.headers['content-encoding'], 'gzip'); assert.equal(gunzipSync(raw.body).toString(), 'compressed body');
 });
 
 test('the preflight answers what the browser asks, private network access included', async () => {
   const { base } = await relay();
-  const response = await fetch(`${base}/${TOKEN}/?url=x`, { method: 'OPTIONS', headers: { origin: ORIGIN, 'access-control-request-method': 'PUT', 'access-control-request-headers': 'x-apkweb-cookie, content-type', 'access-control-request-private-network': 'true' } });
+  const response = await fetch(`${base}/?url=x`, { method: 'OPTIONS', headers: { origin: ORIGIN, 'access-control-request-method': 'PUT', 'access-control-request-headers': 'x-apkweb-cookie, content-type', 'access-control-request-private-network': 'true' } });
   assert.equal(response.status, 204);
   assert.deepEqual([response.headers.get('access-control-allow-methods'), response.headers.get('access-control-allow-headers'), response.headers.get('access-control-allow-private-network'), response.headers.get('access-control-allow-origin')], ['PUT', 'x-apkweb-cookie, content-type', 'true', ORIGIN]);
 });
 
-test('refusals: a wrong token, another page, a bad url; every destination is reached, this computer included; an unreachable one is a 502 with the code the lab maps', async () => {
+test('refusals: an unknown path, another page, a bad url; every destination is reached, this computer included; an unreachable one is a 502 with the code the lab maps', async () => {
   const { base } = await relay();
-  assert.equal((await fetch(`${base}/wrong/?url=${encodeURIComponent(target('/'))}`, { headers: { origin: ORIGIN } })).status, 404);
-  const other = await fetch(`${base}/${TOKEN}/?url=${encodeURIComponent(target('/'))}`, { headers: { origin: 'https://evil.example' } }); assert.equal(other.status, 403); assert.equal(other.headers.get('access-control-allow-origin'), null);
+  assert.equal((await fetch(`${base}/a/b/c?url=${encodeURIComponent(target('/'))}`, { headers: { origin: ORIGIN } })).status, 404);
+  const other = await fetch(`${base}/?url=${encodeURIComponent(target('/'))}`, { headers: { origin: 'https://evil.example' } }); assert.equal(other.status, 403); assert.equal(other.headers.get('access-control-allow-origin'), null);
   assert.equal((await via(base, 'nota url')).status, 400); assert.equal((await via(base, 'file:///etc/passwd')).status, 400);
   const local = await via(base, target('/'));   // a server on this computer, with no option: the relay has no list of forbidden destinations
   assert.equal(local.status, 200); assert.equal(local.headers.get('x-apkweb-relay-error-code'), null);
@@ -79,24 +79,25 @@ test('refusals: a wrong token, another page, a bad url; every destination is rea
 });
 
 test('the status page: only for this computer\'s own names, with the proxy address and the recent requests (no query strings)', async () => {
-  const { base, port, server } = await relay({ port: 9999 });
+  const { base, port, server } = await relay({ port: 9999 }), standard = await relay();
+  const usual = await (await fetch(`${standard.base}/`)).text(); assert.match(usual, /Nothing to copy/); assert.match(usual, /finds this relay by itself/);
   await via(base, target('/logged?key=secret'));
   const page = await fetch(`${base}/`); assert.equal(page.status, 200); const html = await page.text();
-  assert.match(html, new RegExp(`http://127\\.0\\.0\\.1:9999/${TOKEN}/\\?url=\\{url\\}`)); assert.doesNotMatch(html, /lab\.example\.test|Allowed pages|Páginas que podem usar/, 'the allowed pages are not listed on the status page'); assert.match(html, /reaches any destination/); assert.match(html, /<html lang="en">/);
+  assert.match(html, /http:\/\/127\.0\.0\.1:9999\/\?url=\{url\}/); assert.match(html, /on port 8787 only/); assert.equal(proxyAddress(9999), 'http://127.0.0.1:9999/?url={url}'); assert.doesNotMatch(html, /lab\.example\.test|Allowed pages|Páginas que podem usar/, 'the allowed pages are not listed on the status page'); assert.match(html, /reaches any destination/); assert.match(html, /<html lang="en">/);
   const status = await (await fetch(`${base}/status.json`)).json(); assert.equal(status.recent.at(-1).url, target('/logged')); assert.equal(status.recent.at(-1).status, 200);
   assert.ok(!JSON.stringify(server.recent).includes('secret'));
   const rebound = await new Promise(resolve => http.get({ host: '127.0.0.1', port, path: '/', headers: { host: 'attacker.example:80' } }, res => { res.resume(); resolve(res.statusCode); }));
   assert.equal(rebound, 403, 'a page reached through another name (DNS rebinding) gets nothing');
 });
 
-test('settings: the command line over the saved ones, a token kept between runs, the config folder of each system', () => {
-  assert.deepEqual(parseArguments([]), { port: null, origins: [], token: null, newToken: false, open: true });
+test('settings: the command line over the saved ones, a token of an older version dropped, the config folder of each system', () => {
+  assert.deepEqual(parseArguments([]), { port: null, origins: [], ca: [], ignored: [], open: true });
   const parsed = parseArguments(['--port', '9000', '--origin', 'http://localhost:5173/', '--allow-private', '--no-open', '-psn_0_123']);
   assert.deepEqual([parsed.port, parsed.origins, parsed.open, 'allowPrivate' in parsed], [9000, ['http://localhost:5173'], false, false], '--allow-private (from older versions) is accepted and does nothing');
-  for (const bad of [['--port', '0'], ['--port'], ['--origin', 'http://x.example/path'], ['--token', 'a b'], ['--what']]) assert.throws(() => parseArguments(bad), undefined, bad.join(' '));
-  const first = resolveSettings({}, parseArguments([])); assert.match(first.token, /^[0-9a-f]{24}$/); assert.deepEqual([first.port, first.origins, 'allowPrivate' in first], [8787, DEFAULT_ORIGINS, false]);
-  assert.equal(resolveSettings(first, parseArguments([])).token, first.token, 'the same address next time');
-  assert.notEqual(resolveSettings(first, parseArguments(['--new-token'])).token, first.token);
+  for (const bad of [['--port', '0'], ['--port'], ['--origin', 'http://x.example/path'], ['--token'], ['--ca', '/does/not/exist.pem'], ['--what']]) assert.throws(() => parseArguments(bad), undefined, bad.join(' '));
+  assert.deepEqual(parseArguments(['--token', 'abc', '--new-token']).ignored, ['--token', '--new-token'], 'the options of the versions with a token still start the relay');
+  const first = resolveSettings({ token: 'saved-by-0.5.0' }, parseArguments([])); assert.deepEqual(first, { port: 8787, origins: DEFAULT_ORIGINS });
+  assert.equal(resolveSettings({ port: 9001 }, parseArguments([])).port, 9001, 'the port is kept'); assert.equal(resolveSettings({ port: 0 }, parseArguments([])).port, 8787);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-test-'));
   try { assert.equal(saveSettings(dir, first), true); assert.deepEqual(loadSettings(dir), first); assert.deepEqual(loadSettings(path.join(dir, 'none')), {}); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   assert.equal(configDir({ APPDATA: 'C:\\Users\\a\\AppData\\Roaming' }, 'win32', 'C:\\Users\\a'), path.join('C:\\Users\\a\\AppData\\Roaming', 'apk-lab-relay'));
@@ -104,12 +105,12 @@ test('settings: the command line over the saved ones, a token kept between runs,
   assert.equal(configDir({ XDG_CONFIG_HOME: '/x' }, 'linux', '/home/a'), path.join('/x', 'apk-lab-relay'));
 });
 
-test('the TCP tunnel: a WebSocket on /<token>/tcp connects to the target and copies bytes both ways; private targets, closed ports and other pages are refused', async () => {
+test('the TCP tunnel: a WebSocket on /tcp connects to the target and copies bytes both ways; private targets, closed ports and other pages are refused', async () => {
   const net = require('node:net');
   const target = net.createServer(socket => socket.on('data', chunk => socket.write(Buffer.concat([Buffer.from('<'), chunk, Buffer.from('>')]))));
   const targetPort = await listen(target);
   const open = (port, query, origin = ORIGIN) => {
-    const socket = new WebSocket(`ws://127.0.0.1:${port}/${TOKEN}/tcp?${query}`, { headers: { origin } }), messages = []; socket.binaryType = 'arraybuffer';
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/tcp?${query}`, { headers: { origin } }), messages = []; socket.binaryType = 'arraybuffer';
     socket.onmessage = event => messages.push(typeof event.data === 'string' ? JSON.parse(event.data) : Buffer.from(event.data).toString());
     const until = async (check, what) => { for (let i = 0; i < 300; i++) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 10)); } assert.fail(`${what}: ${JSON.stringify(messages)}`); };
     return { socket, messages, until };
@@ -123,15 +124,15 @@ test('the TCP tunnel: a WebSocket on /<token>/tcp connects to the target and cop
   live.socket.close();
   const plain = await relay(), local = open(plain.port, `host=127.0.0.1&port=${targetPort}`);   // no option needed for this computer
   await local.until(() => local.messages.length, 'connected without options'); assert.deepEqual(local.messages[0], { connected: true, alpn: null });
-  const stranger = new WebSocket(`ws://127.0.0.1:${port}/${TOKEN}/tcp?host=127.0.0.1&port=${targetPort}`, { headers: { origin: 'https://evil.example' } });
+  const stranger = new WebSocket(`ws://127.0.0.1:${port}/tcp?host=127.0.0.1&port=${targetPort}`, { headers: { origin: 'https://evil.example' } });
   assert.equal(await new Promise(resolve => { stranger.onopen = () => resolve('open'); stranger.onerror = () => resolve('refused'); }), 'refused');
   local.socket.close(); target.close(); for (const s of [server, plain.server]) s.closeAllConnections?.();
 });
 
-// ---- the parallel channel (/<token>/mux, since 0.4.0): the protocol the lab's src/relay-mux.js speaks ------------------------------------------------------------------------
+// ---- the parallel channel (/mux, since 0.4.0): the protocol the lab's src/relay-mux.js speaks ------------------------------------------------------------------------
 /** A channel client as the lab's: JSON control messages, binary frames [kind][id u32][bytes]; collects every exchange's head, body, end and error, and grants credit only when told. */
-function channelClient(port, { origin = ORIGIN, token = TOKEN, autoCredit = true } = {}) {
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/${token}/mux`, { headers: { origin } }), exchanges = new Map(); let hello = null, nextId = 1, failed = false;
+function channelClient(port, { origin = ORIGIN, token = null, autoCredit = true } = {}) {
+  const socket = new WebSocket(`ws://127.0.0.1:${port}${token ? `/${token}` : ''}/mux`, { headers: { origin } }), exchanges = new Map(); let hello = null, nextId = 1, failed = false;
   socket.binaryType = 'arraybuffer';
   const of = id => { if (!exchanges.has(id)) exchanges.set(id, { head: null, chunks: [], bytes: 0, end: false, error: null }); return exchanges.get(id); };
   socket.onmessage = event => {
@@ -167,8 +168,8 @@ test('the channel: a hello first, then exchanges decided as the per-request path
   client.socket.close();
 });
 
-test('the channel runs exchanges at once, holds each to its credit, aborts on request and reports unreachable targets by code; other pages and tokens are refused', async () => {
-  const slow = http.createServer((req, res) => { const url = new URL(req.url, 'http://x'); if (url.pathname === '/big') { res.writeHead(200, { 'content-length': String(4 * 1024 * 1024) }); const block = Buffer.alloc(64 * 1024, 1); let sent = 0; const pump = () => { while (sent < 4 * 1024 * 1024) { sent += block.length; if (!res.write(block)) return res.once('drain', pump); } res.end(); }; slow.big = () => sent; return pump(); } if (url.pathname === '/hang') { slow.hung = req; req.on('close', () => { slow.closed = true; }); return; } setTimeout(() => res.end(`late ${url.search}`), 150); });
+test('the channel runs exchanges at once, holds each to its credit, aborts on request and reports unreachable targets by code; other pages are refused, an address of an older version is not', async () => {
+  const slow = http.createServer((req, res) => { const url = new URL(req.url, 'http://x'); if (url.pathname === '/big') { res.writeHead(200, { 'content-length': String(16 * 1024 * 1024) }); const block = Buffer.alloc(64 * 1024, 1); let sent = 0; const pump = () => { while (sent < 16 * 1024 * 1024) { sent += block.length; if (!res.write(block)) return res.once('drain', pump); } res.end(); }; slow.big = () => sent; return pump(); } if (url.pathname === '/hang') { slow.hung = req; req.on('close', () => { slow.closed = true; }); return; } setTimeout(() => res.end(`late ${url.search}`), 150); });
   const slowPort = await listen(slow), { port, server } = await relay(), client = channelClient(port);
   await client.until(() => client.hello(), 'hello');
   const begin = Date.now(), ids = Array.from({ length: 30 }, (_, i) => client.request(`http://127.0.0.1:${slowPort}/d?i=${i}`));
@@ -177,14 +178,41 @@ test('the channel runs exchanges at once, holds each to its credit, aborts on re
   const held = channelClient(port, { autoCredit: false }); await held.until(() => held.hello(), 'hello');
   const big = held.request(`http://127.0.0.1:${slowPort}/big`); await held.until(() => held.exchanges.get(big).bytes >= 262144, 'one window');
   await new Promise(resolve => setTimeout(resolve, 300));
-  assert.equal(held.exchanges.get(big).bytes, 262144, 'never more than the credit'); assert.ok(slow.big() < 3 * 1024 * 1024, `the target was held back (${slow.big()} bytes sent)`);
-  held.socket.send(JSON.stringify({ t: 'credit', id: big, n: 4 * 1024 * 1024 })); await held.until(() => held.exchanges.get(big).end, 'the rest after credit'); assert.equal(held.exchanges.get(big).bytes, 4 * 1024 * 1024);
+  assert.equal(held.exchanges.get(big).bytes, 262144, 'never more than the credit'); assert.ok(slow.big() < 12 * 1024 * 1024, `the target was held back (${slow.big()} bytes sent)`);
+  held.socket.send(JSON.stringify({ t: 'credit', id: big, n: 16 * 1024 * 1024 })); await held.until(() => held.exchanges.get(big).end, 'the rest after credit'); assert.equal(held.exchanges.get(big).bytes, 16 * 1024 * 1024);
   const hang = client.request(`http://127.0.0.1:${slowPort}/hang`); await client.until(() => slow.hung, 'the target asked');
   client.socket.send(JSON.stringify({ t: 'abort', id: hang })); await client.until(() => slow.closed, 'the upstream request destroyed');
   const closed = http.createServer(), closedPort = await listen(closed); closed.close();
   const refused = client.request(`http://127.0.0.1:${closedPort}/`); await client.until(() => client.exchanges.get(refused).error, 'the error'); assert.equal(client.exchanges.get(refused).error.code, 'ECONNREFUSED');
   const status = await (await fetch(`http://127.0.0.1:${port}/status.json`)).json(); assert.equal(status.channels, 2); assert.ok(status.recent.some(item => item.via === 'channel' && item.status === 200));
-  const stranger = channelClient(port, { origin: 'https://evil.example' }), wrong = channelClient(port, { token: 'another-token' });
-  await stranger.until(() => stranger.failed(), 'another page refused'); await wrong.until(() => wrong.failed(), 'another token refused');
+  const stranger = channelClient(port, { origin: 'https://evil.example' }), older = channelClient(port, { token: 'a-token-of-0-5-0' });
+  await stranger.until(() => stranger.failed(), 'another page refused'); await older.until(() => older.hello(), 'the address of an older version still opens the channel'); older.socket.close();
   client.socket.close(); held.socket.close(); slow.closeAllConnections?.(); slow.close();
+});
+
+test('GET /hello says this is the APK Lab Relay, to an allowed page only: how the lab finds it by itself', async () => {
+  const { base } = await relay();
+  const response = await fetch(`${base}/hello`, { headers: { origin: ORIGIN } }); assert.equal(response.status, 200);
+  assert.deepEqual([response.headers.get('access-control-allow-origin'), response.headers.get('cache-control')], [ORIGIN, 'no-store']);
+  assert.deepEqual(await response.json(), { relay: 'apk-lab-relay', version: VERSION, features: ['client-identity', 'mux', 'webview', 'tcp'] });
+  assert.equal((await fetch(`${base}/hello`, { headers: { origin: 'https://evil.example' } })).status, 403); assert.equal((await fetch(`${base}/hello`)).status, 403, 'no page, no answer');
+  const preflight = await fetch(`${base}/hello`, { method: 'OPTIONS', headers: { origin: ORIGIN, 'access-control-request-method': 'GET', 'access-control-request-private-network': 'true' } });
+  assert.deepEqual([preflight.status, preflight.headers.get('access-control-allow-private-network')], [204, 'true']);
+});
+
+test('an address with a token, from an older version, keeps working; the token is ignored', async () => {
+  const { base } = await relay();
+  assert.equal((await fetch(`${base}/any-token-123/?url=${encodeURIComponent(target('/old'))}`, { headers: { origin: ORIGIN } })).status, 200);
+  assert.equal((await fetch(`${base}/any-token-123/?url=${encodeURIComponent(target('/old'))}`, { headers: { origin: 'https://evil.example' } })).status, 403, 'the origin rule holds');
+  assert.equal((await fetch(`${base}/any-token-123/?url=${encodeURIComponent(target('/old'))}`)).status, 403, 'a request with no Origin (an image of another site) is refused');
+  assert.deepEqual(['/', '/hello', '/mux', '/tcp', '/webview', '/tok', '/tok/', '/tok/mux', '/tok/hello', '/mux/mux', '/a/b/c', '/a/b'].map(relayRoute), ['request', 'hello', 'mux', 'tcp', 'webview', 'request', 'request', 'mux', 'hello', null, null, null]);
+});
+
+test('client certificates: refused when malformed, forgotten on request, and a request that names one the relay does not hold is not sent', async () => {
+  const { base, server } = await relay(), to = encodeURIComponent('https://127.0.0.1:9/');
+  const post = (query, body) => fetch(`${base}/?url=${to}&${query}`, { method: 'POST', body, headers: { origin: ORIGIN } });
+  assert.equal((await post('client-identity=1', 'not json')).status, 400); assert.equal(server.clientIdentityCount(), 0);
+  const forget = await post('client-identity=forget-all', ''); assert.deepEqual([forget.status, forget.headers.get('x-apkweb-relay-features')], [204, 'client-identity']);
+  const missing = await fetch(`${base}/?url=${to}&client-identity-key=10:abc`, { headers: { origin: ORIGIN } });
+  assert.deepEqual([missing.status, missing.headers.get('x-apkweb-relay-error-code')], [502, 'APKWEB_RELAY_NO_CLIENT_IDENTITY']);
 });

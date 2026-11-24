@@ -7,7 +7,7 @@ const http = require('node:http');
 const { createRelay } = require('../src/relay.cjs');
 const { injectIntoHead, rewriteMarkup } = require('../src/webview.cjs');
 
-const ORIGIN = 'https://lab.example.test', TOKEN = 'test-token-123';
+const ORIGIN = 'https://lab.example.test';
 const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 const seen = [];
 const upstream = http.createServer((req, res) => {
@@ -27,8 +27,8 @@ test.before(async () => { upstreamPort = await listen(upstream); });
 test.after(() => { upstream.close(); for (const server of relays) server.close(); });
 
 async function setup() {
-  const server = createRelay({ token: TOKEN, origins: [ORIGIN] }); relays.push(server); const port = await listen(server);
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/${TOKEN}/webview`, { headers: { origin: ORIGIN } });
+  const server = createRelay({ origins: [ORIGIN] }); relays.push(server); const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/webview`, { headers: { origin: ORIGIN } });
   const inbox = [], waiters = [];
   ws.onmessage = event => { const message = JSON.parse(event.data); inbox.push(message); for (const w of [...waiters]) if (w.match(message)) { waiters.splice(waiters.indexOf(w), 1); w.resolve(message); } };
   const next = match => { const found = inbox.find(match); if (found) { inbox.splice(inbox.indexOf(found), 1); return Promise.resolve(found); } return new Promise(resolve => waiters.push({ match: m => { if (!match(m)) return false; inbox.splice(inbox.indexOf(m), 1); return true; }, resolve })); };
@@ -122,9 +122,9 @@ test('the lab refuses (a network error for the frame), answers itself, cancels a
   assert.equal((await frame(frameUrl)).status, 404);
 });
 
-test('the channel needs the token and an allowed origin; a closed channel takes its slots with it', async () => {
+test('the channel needs an allowed origin; a closed channel takes its slots with it', async () => {
   const { port, next, say, ws, server } = await setup();
-  const refused = await new Promise(resolve => { const bad = new WebSocket(`ws://127.0.0.1:${port}/${TOKEN}/webview`, { headers: { origin: 'https://evil.example' } }); bad.onopen = () => resolve('open'); bad.onerror = () => resolve('refused'); });
+  const refused = await new Promise(resolve => { const bad = new WebSocket(`ws://127.0.0.1:${port}/webview`, { headers: { origin: 'https://evil.example' } }); bad.onopen = () => resolve('open'); bad.onerror = () => resolve('refused'); });
   assert.equal(refused, 'refused');
   say({ t: 'open', id: 3, view: 2, url: `http://127.0.0.1:${upstreamPort}/data` });
   const { frameUrl } = await next(m => m.t === 'opened');
