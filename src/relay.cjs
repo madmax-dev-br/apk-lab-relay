@@ -35,7 +35,7 @@ const { spawn } = require('node:child_process');
 const { createWebViewRelay } = require('./webview.cjs');
 const { readFileSync, statSync } = fs;
 
-const VERSION = '0.7.1';
+const VERSION = '0.7.2';
 const RECENT = 50;
 const DEFAULT_ORIGINS = ['https://madmax-dev-br.github.io', 'http://127.0.0.1:8765', 'http://localhost:8765'];
 const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'host', 'content-length', 'expect']);
@@ -458,8 +458,11 @@ function send(url, method, headers, body, timeoutMs, hops = 0, identities = null
     const outgoing = {}; headers.forEach((value, name) => { outgoing[name] = name.toLowerCase() === 'cookie' ? value : (outgoing[name] ? `${outgoing[name]}, ${value}` : value); });
     if (body) outgoing['content-length'] = String(body.length);
     const roots = url.protocol === 'https:' ? trusted(ca) : null;   // asked now: a renewed --ca file applies to the next connection
-    const agent = transport.agents?.[url.protocol];   // the relay's keep-alive agents; a connection with its own TLS material (a client identity, --ca roots) is not pooled
-    const request = (url.protocol === 'https:' ? https : http).request(url, { method, headers: outgoing, timeout: timeoutMs, ...(agent ? { agent } : {}), ...(transport.signal ? { signal: transport.signal } : {}), ...(transport.lookup ? { lookup: transport.lookup } : {}), ...(identity ? { key: identity.key, cert: identity.cert, agent: false } : {}), ...(roots ? { ca: roots, agent: false } : {}) }, response => {
+    // the relay's keep-alive agents, for every connection: an https.Agent pools by the TLS material of the request too (its key, cert and ca are part of the pool's name), so a
+    // connection that presented a client identity is reused only by requests that name that identity, as a phone's HTTP client keeps its mTLS connection open. A new connection
+    // per request (what the relay did before 0.7.2) cost every such request a full TLS handshake with the server.
+    const agent = transport.agents?.[url.protocol];
+    const request = (url.protocol === 'https:' ? https : http).request(url, { method, headers: outgoing, timeout: timeoutMs, ...(agent ? { agent } : {}), ...(transport.signal ? { signal: transport.signal } : {}), ...(transport.lookup ? { lookup: transport.lookup } : {}), ...(identity ? { key: identity.key, cert: identity.cert } : {}), ...(roots ? { ca: roots } : {}) }, response => {
       const status = response.statusCode, location = response.headers.location;
       if (!transport.manualRedirects && [301, 302, 303, 307, 308].includes(status) && location) {
         response.resume();

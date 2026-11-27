@@ -60,3 +60,28 @@ test('a client identity goes only to a request that names it: none by itself, an
     assert.deepEqual(await ask(older.id), [502, 'APKWEB_RELAY_NO_CLIENT_IDENTITY'], 'the replaced certificate is gone');
   } finally { relay.close(); server.close(); }
 });
+
+test('connections that present a client identity are kept alive and reused only by requests that name that identity', { skip: haveOpenssl ? false : 'openssl is not installed' }, async () => {
+  const certs = certificates(['device', 'other']);
+  let connections = 0;
+  const server = https.createServer({ key: certs.server.key, cert: certs.server.cert, ca: certs.ca, requestCert: true, rejectUnauthorized: false, keepAliveTimeout: 30000 }, (req, res) => {
+    const peer = req.socket.getPeerCertificate(); res.end(peer?.subject?.CN ?? 'none');
+  });
+  server.on('secureConnection', () => connections++);
+  const relay = createRelay({ origins: [ORIGIN], ca: [certs.ca] });
+  try {
+    const serverPort = await listen(server), base = `http://127.0.0.1:${await listen(relay)}`, target = `https://127.0.0.1:${serverPort}/who`;
+    const hand = id => fetch(`${base}/?url=${encodeURIComponent(`https://127.0.0.1:${serverPort}/`)}&client-identity=1`, { method: 'POST', body: id.body, headers: { origin: ORIGIN } });
+    const ask = async key => { const response = await fetch(`${base}/?url=${encodeURIComponent(target)}${key ? `&client-identity-key=${encodeURIComponent(key)}` : ''}`, { headers: { origin: ORIGIN } }); return `${response.status} ${await response.text()}`; };
+    const device = identity(certs.device), other = identity(certs.other);
+    assert.equal((await hand(device)).status, 204);
+    for (let i = 0; i < 10; i++) assert.equal(await ask(device.id), '200 device');
+    assert.equal(connections, 1, 'ten requests naming the identity share one TLS connection (a new one each time costs a handshake with the server)');
+    assert.equal(await ask(null), '200 none', 'a request that names no identity does not ride the connection that presented one');
+    assert.equal(connections, 2);
+    assert.equal((await hand(other)).status, 204);
+    assert.equal(await ask(other.id), '200 other', 'another identity gets a connection of its own');
+    assert.equal(connections, 3);
+    assert.equal((await ask(device.id)).slice(0, 3), '502', 'the replaced identity is not presented, although a connection made with it may still be open');
+  } finally { relay.close(); server.close(); }
+});
