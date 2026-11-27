@@ -17,8 +17,16 @@ The executables are in [Releases](../../releases/latest):
 | macOS (Intel) | `apk-lab-relay-macos-x64.tar.gz` |
 | Linux (x64) | `apk-lab-relay-linux-x64.tar.gz` |
 | Linux (ARM64) | `apk-lab-relay-linux-arm64.tar.gz` |
+| Any system with Node.js 22+ | `apk-lab-relay.cjs` (the same relay as one script: `node apk-lab-relay.cjs`) |
 
 `SHA256SUMS.txt` has the hash of each file.
+
+```bash
+curl -LO https://github.com/madmax-dev-br/apk-lab-relay/releases/latest/download/apk-lab-relay.cjs
+node apk-lab-relay.cjs
+```
+
+This project is the only relay of the lab: the lab's repository keeps no copy of it, and its tests run against a checkout of this one placed beside it.
 
 ## Use
 
@@ -44,6 +52,7 @@ apk-lab-relay [options]
   --origin <url>       a page that may use the relay (repeat for several; saved)
   --ca <file.pem>      also trust the certificates of this file (a server with an internal CA)
   --no-open            do not open the status page in the browser
+  --config-dir <dir>   keep the settings in this folder (also APK_LAB_RELAY_CONFIG_DIR)
   --version, --help
 ```
 
@@ -57,7 +66,7 @@ Settings live in `%APPDATA%\apk-lab-relay` (Windows), `~/Library/Application Sup
 
 - The relay listens only on `127.0.0.1`: another computer on the network cannot reach it.
 - Every request, WebSockets included, must come from one of the allowed pages (its `Origin`, which a page cannot change), so another site open in the same browser cannot use the relay. There is no token: a program on this computer can use the relay, as it could reach the network by itself.
-- A client certificate the lab hands over (mutual TLS) is kept in memory only, for the destination it was chosen for.
+- A client certificate the lab hands over (mutual TLS) is kept in memory only, for the destination it was chosen for, and presented only to a request that names it (since 0.7.0): a request that names no certificate gets none, and one that names a certificate the relay does not hold (the app chose a new one, or the relay restarted) is refused with `APKWEB_RELAY_NO_CLIENT_IDENTITY` so the lab hands the new one. Before 0.7.0 the last certificate the relay held for a server went to every request to it, so a replaced or expired certificate kept going out until the relay was restarted.
 - Destinations are not restricted: whatever the lab asks for, the relay fetches from your computer, including servers on this computer and on your local network.
 - The status page answers only to `127.0.0.1` and `localhost`, which protects against *DNS rebinding*.
 - WebView documents (since 0.5.0) are served on `http://<label>.localhost:<port>` addresses whose 20-hex-digit label is the capability: it exists only while the lab page that opened it is connected.

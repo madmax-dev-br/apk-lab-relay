@@ -12,7 +12,7 @@
 //  - Set-Cookie, which a browser never exposes, comes back as `x-apkweb-set-cookie`: a JSON array of the Set-Cookie values;
 //  - a failure to reach the target is a 502 with `x-apkweb-relay-error-code` (ENOTFOUND, ECONNREFUSED, ETIMEDOUT, ECONNRESET, CERT_..., the codes Node uses) and
 //    `x-apkweb-relay-error`, which the lab turns into the exception an Android device would throw (UnknownHostException, ConnectException, SSLHandshakeException ...);
-//  - client certificates (mutual TLS, since 0.6.0): the lab hands over the one an app chose for a destination; it is kept in memory only and presented to that destination alone;
+//  - client certificates (mutual TLS, since 0.6.0; presented only to the request that names them since 0.7.0): the lab hands over the one an app chose for a destination; it is kept in memory only and presented to that destination alone;
 //  - the parallel channel (since 0.4.0; /mux, a WebSocket): many exchanges at once over one connection, with a credit window per exchange (protocol at muxChannel and in README.md);
 //  - WebView documents (since 0.5.0; src/webview.cjs): the lab's WebViews show web pages served here on http://<label>.localhost:<port>, every request decided by the lab.
 //
@@ -35,7 +35,7 @@ const { spawn } = require('node:child_process');
 const { createWebViewRelay } = require('./webview.cjs');
 const { readFileSync, statSync } = fs;
 
-const VERSION = '0.6.0';
+const VERSION = '0.7.0';
 const RECENT = 50;
 const DEFAULT_ORIGINS = ['https://madmax-dev-br.github.io', 'http://127.0.0.1:8765', 'http://localhost:8765'];
 const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'host', 'content-length', 'expect']);
@@ -121,7 +121,7 @@ function createRelay({ origins = DEFAULT_ORIGINS, timeoutMs = 60000, ca: caOptio
       body = Buffer.concat(chunks);
     }
     let response;
-    try { response = await send(parsed, req.method, headers, body, timeoutMs, 0, identities, ca, transport); }
+    try { response = await send(parsed, req.method, headers, body, timeoutMs, 0, identities, ca, { ...transport, identityKey: url.searchParams.get('client-identity-key') }); }
     catch (error) { return relayError(error?.code ?? 'EFETCH', String(error?.message ?? error)); }
     const exposed = [];
     for (const [name, value] of Object.entries(response.headers)) { const lower = name.toLowerCase(); if (RESPONSE_DROP.has(lower) || lower.startsWith('access-control-')) continue; res.setHeader(name, value); exposed.push(name); }
@@ -203,7 +203,7 @@ async function relayAnswer({ method, params, headers: entries, body, length = 0,
   const missing = missingIdentity(identities, params, parsed.protocol === 'https:' ? destination(parsed.hostname, parsed.port || '443') : null);
   if (missing) return { error: { code: NO_IDENTITY_CODE, message: missing } };
   if (length > MAX_BODY) return { local: { status: 413, message: 'request body over 32 MiB' } };
-  try { return { response: await send(parsed, method, upstreamHeaders(entries), method !== 'GET' && method !== 'HEAD' && body?.length ? body : undefined, timeoutMs, 0, identities, ca, { ...transport, signal }) }; }
+  try { return { response: await send(parsed, method, upstreamHeaders(entries), method !== 'GET' && method !== 'HEAD' && body?.length ? body : undefined, timeoutMs, 0, identities, ca, { ...transport, signal, identityKey: params.get('client-identity-key') }) }; }
   catch (error) { return { error: { code: error?.code ?? 'EFETCH', message: String(error?.message ?? error).replace(/[\r\n]+/g, ' ').slice(0, 300) } }; }
 }
 
@@ -364,12 +364,21 @@ const pem = (label, bytes) => `-----BEGIN ${label}-----\n${bytes.toString('base6
 /** The id of an identity, as the lab computes it (src/client-identity.js identityKey): the length and FNV-1a of the leaf certificate's DER. */
 const identityId = leafDer => { let h = 0x811c9dc5; for (const b of leafDer) h = Math.imul(h ^ b, 0x01000193) >>> 0; return `${leafDer.length}:${h.toString(16)}`; };
 /**
- * A request that names the identity it needs (client-identity-key) for a destination this relay holds none for: the reason it must not go out, else null. A relay holding another
- * identity for it presents that one (the latest the app chose for the destination), as before.
+ * A client identity is presented only to a request that names it (client-identity-key: the id of the leaf certificate the app's KeyManager chose for this connection) and only
+ * while the relay holds exactly that one for the destination. A request that names none gets none: an identity handed over earlier (another run of the app, a certificate the
+ * app has since renewed, an expired one) never reaches a server by itself. Before 0.7.0 the relay presented whatever it last held for the destination, so a certificate that
+ * had expired kept going out until the relay was restarted.
  */
+function chosenIdentity(identities, where, wanted) {
+  if (!wanted || !where) return null;
+  const held = identities?.get(where); return held && held.id === wanted ? held : null;
+}
+/** A request that names an identity the relay does not hold for its destination (none: the relay was restarted or forgot it; another: the app chose a new certificate): the reason it must not go out, else null. The lab hands the identity (again) and repeats the request. */
 function missingIdentity(identities, params, where) {
   const wanted = params.get('client-identity-key'); if (!wanted || !where) return null;
-  return identities.has(where) ? null : `the relay holds no client certificate for ${where} (it was restarted, or forgot it): the lab hands it again`;
+  const held = identities.get(where);
+  if (!held) return `the relay holds no client certificate for ${where} (it was restarted, or forgot it): the lab hands it again`;
+  return held.id === wanted ? null : `the relay holds another client certificate for ${where} than the one this connection chose: the lab hands the new one`;
 }
 /** {key: base64 PKCS#8, chain: [base64 DER]} -> { key, cert } in PEM, checked by node:crypto; null for an empty chain (forget). */
 function parseIdentity(body) {
@@ -398,7 +407,7 @@ async function tunnel({ req, socket, route, allowed, timeoutMs, identities, ca =
   if (missing) return fail(NO_IDENTITY_CODE, missing);
   let connected = false; const started = Date.now();
   const roots = secure ? trusted(ca) : null;
-  const identity = secure ? identities?.get(destination(host, port)) : null;
+  const identity = secure ? chosenIdentity(identities, destination(host, port), url.searchParams.get('client-identity-key')) : null;   // only the identity this tunnel named
   const upstream = secure ? tls.connect({ host, port, servername: isIP(host) ? undefined : host, ALPNProtocols: alpn.length ? alpn : undefined, ...(identity ? { key: identity.key, cert: identity.cert } : {}), ...(roots ? { ca: roots } : {}) }) : net.connect({ host, port });
   const timer = setTimeout(() => { if (!connected) { upstream.destroy(); fail('ETIMEDOUT', `connect to ${host}:${port} timed out after ${timeoutMs} ms`); } }, timeoutMs);
   upstream.once(secure ? 'secureConnect' : 'connect', () => { connected = true; clearTimeout(timer); upstream.setNoDelay?.(true); say({ connected: true, alpn: secure ? upstream.alpnProtocol || null : null }); note({ method: 'TCP', url: `${secure ? 'tls' : 'tcp'}://${host}:${port}`, status: 101, ms: Date.now() - started }); });
@@ -441,10 +450,13 @@ function caFromFiles(files, { warn = message => console.warn(message), now = () 
 
 /** One upstream exchange over node:http(s), following redirects the way fetch does (at most 20; 303, and 301/302 after a POST, continue as GET without a body). */
 function send(url, method, headers, body, timeoutMs, hops = 0, identities = null, ca = null, transport = {}) {
+  // the identity of this hop: the one the request named, for its destination (chosenIdentity); a redirect to another destination of the same exchange presents the identity the app
+  // chose for that destination in this session, if any (the lab names one key per request)
+  const where = url.protocol === 'https:' ? destination(url.hostname, url.port || '443') : null;
+  const identity = where === null ? null : hops === 0 || where === transport.identityFor ? chosenIdentity(identities, where, transport.identityKey) : identities?.get(where) ?? null;
   return new Promise((resolve, reject) => {
     const outgoing = {}; headers.forEach((value, name) => { outgoing[name] = name.toLowerCase() === 'cookie' ? value : (outgoing[name] ? `${outgoing[name]}, ${value}` : value); });
     if (body) outgoing['content-length'] = String(body.length);
-    const identity = url.protocol === 'https:' ? identities?.get(destination(url.hostname, url.port || '443')) : null;   // only the destination the identity was given for
     const roots = url.protocol === 'https:' ? trusted(ca) : null;   // asked now: a renewed --ca file applies to the next connection
     const agent = transport.agents?.[url.protocol];   // the relay's keep-alive agents; a connection with its own TLS material (a client identity, --ca roots) is not pooled
     const request = (url.protocol === 'https:' ? https : http).request(url, { method, headers: outgoing, timeout: timeoutMs, ...(agent ? { agent } : {}), ...(transport.signal ? { signal: transport.signal } : {}), ...(transport.lookup ? { lookup: transport.lookup } : {}), ...(identity ? { key: identity.key, cert: identity.cert, agent: false } : {}), ...(roots ? { ca: roots, agent: false } : {}) }, response => {
@@ -455,7 +467,7 @@ function send(url, method, headers, body, timeoutMs, hops = 0, identities = null
         const next = new URL(location, url), asGet = status === 303 || ((status === 301 || status === 302) && method === 'POST');
         const nextHeaders = new Headers(headers); if (asGet) { nextHeaders.delete('content-type'); nextHeaders.delete('content-length'); }
         if (next.host !== url.host) { nextHeaders.delete('authorization'); nextHeaders.delete('cookie'); }   // credentials never follow a redirect to another host, as with fetch
-        return resolve(send(next, asGet ? 'GET' : method, nextHeaders, asGet ? undefined : body, timeoutMs, hops + 1, identities, ca, transport));
+        return resolve(send(next, asGet ? 'GET' : method, nextHeaders, asGet ? undefined : body, timeoutMs, hops + 1, identities, ca, hops === 0 ? { ...transport, identityFor: where } : transport));
       }
       resolve(response);
     });
@@ -506,6 +518,7 @@ refresh(); setInterval(refresh, 2000);
 
 // ---- the desktop app: settings kept between runs, the command line, the browser opened on the status page ----------------------------------------------------------------
 function configDir(env = process.env, platform = process.platform, home = os.homedir()) {
+  const chosen = env.APK_LAB_RELAY_CONFIG_DIR || env.APKWEB_RELAY_CONFIG_DIR; if (chosen) return chosen;   // another folder (tests, a second relay); APKWEB_RELAY_CONFIG_DIR: the name the lab's own relay used
   if (platform === 'win32') return path.join(env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'apk-lab-relay');
   if (platform === 'darwin') return path.join(home, 'Library', 'Application Support', 'apk-lab-relay');
   return path.join(env.XDG_CONFIG_HOME || path.join(home, '.config'), 'apk-lab-relay');
@@ -524,9 +537,10 @@ Usage: apk-lab-relay [options]
   --origin <url>       a page that may use the relay (repeat for several; saved; default: the published lab and a local copy)
   --ca <file.pem>      also trust the certificates of this file (repeat for several; a server with an internal CA)
   --no-open            do not open the status page in the browser
+  --config-dir <dir>   keep the settings in this folder instead of the system's (also APK_LAB_RELAY_CONFIG_DIR)
   --version, --help`;
 function parseArguments(argv) {
-  const options = { port: null, origins: [], ca: [], ignored: [], open: true };
+  const options = { port: null, origins: [], ca: [], ignored: [], open: true, configDir: null };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i], value = () => { if (i + 1 >= argv.length) throw new Error(`${arg} needs a value`); return argv[++i]; };
     if (arg === '--port') options.port = Number(value());
@@ -536,6 +550,7 @@ function parseArguments(argv) {
     else if (arg === '--new-token') options.ignored.push(arg);
     else if (arg === '--allow-private' || arg === '--no-allow-private') continue;   // older versions blocked private destinations; every destination is reachable now, so the option does nothing
     else if (arg === '--no-open') options.open = false;
+    else if (arg === '--config-dir') options.configDir = path.resolve(value());
     else if (arg === '--help' || arg === '-h') options.help = true;
     else if (arg === '--version' || arg === '-v') options.version = true;
     else if (arg.startsWith('-psn_')) continue;   // macOS adds a process serial number when the app is opened from Finder
@@ -561,7 +576,7 @@ async function main(argv = process.argv.slice(2)) {
   try { options = parseArguments(argv); } catch (error) { console.error(`${error.message}\n\n${HELP}`); await pause(); process.exitCode = 2; return; }
   if (options.help) { console.log(HELP); return; }
   if (options.version) { console.log(VERSION); return; }
-  const dir = configDir(), settings = resolveSettings(loadSettings(dir), options);
+  const dir = options.configDir ?? configDir(), settings = resolveSettings(loadSettings(dir), options);
   const saved = saveSettings(dir, settings);
   const server = createRelay({ origins: settings.origins, port: settings.port, ca: options.ca.length ? caFromFiles(options.ca) : null });
   const page = `http://127.0.0.1:${settings.port}/`;
@@ -587,6 +602,6 @@ async function main(argv = process.argv.slice(2)) {
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
 }
 
-module.exports = { VERSION, MUX_VERSION, RELAY_NAME, DEFAULT_PORT, DEFAULT_ORIGINS, createRelay, relayRoute, proxyAddress, caFromFiles, identityId, configDir, loadSettings, saveSettings, parseArguments, resolveSettings, main };
+module.exports = { VERSION, MUX_VERSION, RELAY_NAME, DEFAULT_PORT, DEFAULT_ORIGINS, NO_IDENTITY_CODE, FEATURES, createRelay, relayRoute, proxyAddress, caFromFiles, identityId, configDir, loadSettings, saveSettings, parseArguments, resolveSettings, main };
 const isSea = (() => { try { return require('node:sea').isSea(); } catch { return false; } })();   // the single executable built by scripts/build-sea.mjs
 if (isSea || require.main === module) main();

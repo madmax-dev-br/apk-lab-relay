@@ -22,6 +22,8 @@ const local = name => `(() => { const module = { exports: {} }; (function (modul
 const main = readFileSync(path.join(root, 'src', 'relay.cjs'), 'utf8').replace(/require\('\.\/([a-z-]+\.cjs)'\)/g, (whole, name) => local(name));
 if (/require\('\.\//.test(main)) throw new Error('a local require is left in the bundle');
 writeFileSync(bundled, main);
+// the same file is also a release file of its own: the relay as one Node.js script (Node 22+, no dependency), for whoever prefers `node apk-lab-relay.cjs` to an executable
+mkdirSync(release, { recursive: true }); writeFileSync(path.join(release, 'apk-lab-relay.cjs'), `#!/usr/bin/env node\n${main}`); console.log('release/apk-lab-relay.cjs');
 writeFileSync(config, JSON.stringify({ main: bundled, output: blob, disableExperimentalSEAWarning: true, useCodeCache: true }, null, 2));
 run(process.execPath, ['--experimental-sea-config', config]);
 

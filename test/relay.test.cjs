@@ -91,7 +91,8 @@ test('the status page: only for this computer\'s own names, with the proxy addre
 });
 
 test('settings: the command line over the saved ones, a token of an older version dropped, the config folder of each system', () => {
-  assert.deepEqual(parseArguments([]), { port: null, origins: [], ca: [], ignored: [], open: true });
+  assert.deepEqual(parseArguments([]), { port: null, origins: [], ca: [], ignored: [], open: true, configDir: null });
+  assert.equal(parseArguments(['--config-dir', 'relay-settings']).configDir, path.resolve('relay-settings'), 'another settings folder (tests, a second relay)');
   const parsed = parseArguments(['--port', '9000', '--origin', 'http://localhost:5173/', '--allow-private', '--no-open', '-psn_0_123']);
   assert.deepEqual([parsed.port, parsed.origins, parsed.open, 'allowPrivate' in parsed], [9000, ['http://localhost:5173'], false, false], '--allow-private (from older versions) is accepted and does nothing');
   for (const bad of [['--port', '0'], ['--port'], ['--origin', 'http://x.example/path'], ['--token'], ['--ca', '/does/not/exist.pem'], ['--what']]) assert.throws(() => parseArguments(bad), undefined, bad.join(' '));
@@ -103,6 +104,8 @@ test('settings: the command line over the saved ones, a token of an older versio
   assert.equal(configDir({ APPDATA: 'C:\\Users\\a\\AppData\\Roaming' }, 'win32', 'C:\\Users\\a'), path.join('C:\\Users\\a\\AppData\\Roaming', 'apk-lab-relay'));
   assert.equal(configDir({}, 'darwin', '/Users/a'), path.join('/Users/a', 'Library', 'Application Support', 'apk-lab-relay'));
   assert.equal(configDir({ XDG_CONFIG_HOME: '/x' }, 'linux', '/home/a'), path.join('/x', 'apk-lab-relay'));
+  assert.equal(configDir({ APK_LAB_RELAY_CONFIG_DIR: '/tmp/relay-x', APPDATA: 'C:\\x' }, 'win32', 'C:\\Users\\a'), '/tmp/relay-x', 'the folder chosen in the environment wins');
+  assert.equal(configDir({ APKWEB_RELAY_CONFIG_DIR: '/tmp/relay-y' }, 'linux', '/home/a'), '/tmp/relay-y', 'the name the lab\'s own relay used');
 });
 
 test('the TCP tunnel: a WebSocket on /tcp connects to the target and copies bytes both ways; private targets, closed ports and other pages are refused', async () => {
