@@ -35,7 +35,7 @@ const { spawn } = require('node:child_process');
 const { createWebViewRelay } = require('./webview.cjs');
 const { readFileSync, statSync } = fs;
 
-const VERSION = '0.7.0';
+const VERSION = '0.7.1';
 const RECENT = 50;
 const DEFAULT_ORIGINS = ['https://madmax-dev-br.github.io', 'http://127.0.0.1:8765', 'http://localhost:8765'];
 const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'host', 'content-length', 'expect']);

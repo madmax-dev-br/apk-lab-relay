@@ -18,10 +18,12 @@ const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', ()
 /** A CA, a server certificate for 127.0.0.1 and client certificates named `clients`, all signed by the CA. */
 function certificates(clients) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-mtls-'));
-  const ssl = (args, input = '') => execFileSync('openssl', args, { cwd: dir, stdio: ['pipe', 'ignore', 'ignore'], input });
+  // MSYS_NO_PATHCONV / MSYS2_ARG_CONV_EXCL: the openssl of Git for Windows would read -subj /CN=... as a path
+  const ssl = args => execFileSync('openssl', args, { cwd: dir, stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, MSYS_NO_PATHCONV: '1', MSYS2_ARG_CONV_EXCL: '*' } });
   const issue = (name, extension) => {
     ssl(['req', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-keyout', `${name}.key`, '-out', `${name}.csr`, '-subj', `/CN=${name}`]);
-    ssl(['x509', '-req', '-in', `${name}.csr`, '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial', '-out', `${name}.pem`, '-days', '2', '-extfile', '/dev/stdin'], extension);
+    fs.writeFileSync(path.join(dir, `${name}.ext`), extension);   // a file, not /dev/stdin: Windows has none, and some openssl builds do not read a pipe there
+    ssl(['x509', '-req', '-in', `${name}.csr`, '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial', '-out', `${name}.pem`, '-days', '2', '-extfile', `${name}.ext`]);
     return { key: fs.readFileSync(path.join(dir, `${name}.key`), 'utf8'), cert: fs.readFileSync(path.join(dir, `${name}.pem`), 'utf8') };
   };
   ssl(['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-keyout', 'ca.key', '-out', 'ca.pem', '-days', '2', '-subj', '/CN=relay test CA']);
